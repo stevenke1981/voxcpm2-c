@@ -188,14 +188,11 @@ VoxCPMError loc_enc_to_cuda(LocEnc* enc) {
 
     VoxCPMError err;
 
+    // Upload weight matrix (used via tensor_matmul_nt with CUDA dispatch)
     err = tensor_to_cuda(enc->in_proj_weight);
     if (err) return err;
-
-    err = tensor_to_cuda(enc->in_proj_bias);
-    if (err) return err;
-
-    err = tensor_to_cuda(enc->special_token);
-    if (err) return err;
+    // in_proj_bias — keep on CPU (read directly by loc_enc_forward)
+    // special_token — keep on CPU (read directly by loc_enc_forward)
 
     for (int i = 0; i < enc->n_layers; i++) {
         err = transformer_block_to_cuda(&enc->layers[i]);

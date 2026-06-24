@@ -597,47 +597,34 @@ VoxCPMError loc_dit_to_cuda(LocDiT* dit) {
 
     VoxCPMError err;
 
+    // Upload weight matrices (used via tensor_matmul_nt with CUDA dispatch)
     err = tensor_to_cuda(dit->in_proj_weight);
     if (err) return err;
-
-    err = tensor_to_cuda(dit->in_proj_bias);
-    if (err) return err;
+    // in_proj_bias — keep on CPU (read directly by add_bias_2d)
 
     err = tensor_to_cuda(dit->cond_proj_weight);
     if (err) return err;
-
-    err = tensor_to_cuda(dit->cond_proj_bias);
-    if (err) return err;
+    // cond_proj_bias — keep on CPU
 
     err = tensor_to_cuda(dit->out_proj_weight);
     if (err) return err;
-
-    err = tensor_to_cuda(dit->out_proj_bias);
-    if (err) return err;
+    // out_proj_bias — keep on CPU
 
     err = tensor_to_cuda(dit->time_mlp_1_weight);
     if (err) return err;
-
-    err = tensor_to_cuda(dit->time_mlp_1_bias);
-    if (err) return err;
+    // time_mlp_1_bias — keep on CPU
 
     err = tensor_to_cuda(dit->time_mlp_2_weight);
     if (err) return err;
-
-    err = tensor_to_cuda(dit->time_mlp_2_bias);
-    if (err) return err;
+    // time_mlp_2_bias — keep on CPU
 
     err = tensor_to_cuda(dit->delta_mlp_1_weight);
     if (err) return err;
-
-    err = tensor_to_cuda(dit->delta_mlp_1_bias);
-    if (err) return err;
+    // delta_mlp_1_bias — keep on CPU
 
     err = tensor_to_cuda(dit->delta_mlp_2_weight);
     if (err) return err;
-
-    err = tensor_to_cuda(dit->delta_mlp_2_bias);
-    if (err) return err;
+    // delta_mlp_2_bias — keep on CPU
 
     for (int i = 0; i < dit->n_layers; i++) {
         err = transformer_block_to_cuda(&dit->layers[i]);

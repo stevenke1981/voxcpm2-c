@@ -480,15 +480,7 @@ VoxCPMError ralm_to_cuda(RALM* ralm) {
     err = rms_norm_to_cuda(ralm->output_norm);
     if (err) return err;
 
-    /* KV cache (may be NULL if not yet allocated) */
-    if (ralm->cache_k) {
-        err = tensor_to_cuda(ralm->cache_k);
-        if (err) return err;
-    }
-    if (ralm->cache_v) {
-        err = tensor_to_cuda(ralm->cache_v);
-        if (err) return err;
-    }
+    /* KV cache — keep on CPU (attention_forward reads/writes cache->data directly) */
 
     return VOXCPM_SUCCESS;
 #else

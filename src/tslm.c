@@ -412,10 +412,7 @@ VoxCPMError tslm_to_cuda(TSLM* tslm) {
 #ifdef VOXCPM_CUDA
     VoxCPMError err;
 
-    /* Token embedding */
-    err = tensor_to_cuda(tslm->embed_weight);
-    if (err) return err;
-
+    /* Token embedding — keep on CPU (embedding lookup reads data_fp16[] directly) */
     /* Transformer layers */
     for (int i = 0; i < tslm->n_layers; i++) {
         err = transformer_block_to_cuda(&tslm->layers[i]);
@@ -426,15 +423,7 @@ VoxCPMError tslm_to_cuda(TSLM* tslm) {
     err = rms_norm_to_cuda(tslm->output_norm);
     if (err) return err;
 
-    /* KV cache (may be NULL if not yet allocated) */
-    if (tslm->cache_k) {
-        err = tensor_to_cuda(tslm->cache_k);
-        if (err) return err;
-    }
-    if (tslm->cache_v) {
-        err = tensor_to_cuda(tslm->cache_v);
-        if (err) return err;
-    }
+    /* KV cache — keep on CPU (attention_forward reads/writes cache->data directly) */
 
     return VOXCPM_SUCCESS;
 #else

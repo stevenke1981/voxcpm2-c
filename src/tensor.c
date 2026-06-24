@@ -130,6 +130,15 @@ Tensor* tensor_scalar(float value) {
 
 void tensor_free(Tensor* t) {
     if (!t) return;
+#ifdef VOXCPM_CUDA
+    /* GPU-resident tensors: use cudaFree instead of free() */
+    if (t->is_cuda) {
+        tensor_cuda_free(t);
+        free(t->shape);
+        free(t);
+        return;
+    }
+#endif
     if (t->is_owned && t->data) {
         free(t->data);
     }
