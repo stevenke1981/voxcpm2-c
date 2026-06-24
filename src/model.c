@@ -6,6 +6,7 @@
 // Inference pipeline will be implemented in Phase 2.
 
 #include "model.h"
+#include "audio.h"
 #include "platform.h"
 
 #include <stdio.h>
@@ -714,7 +715,10 @@ VoxCPMError voxcpm_generate(
     tensor_free(latent_vae);
     if (err) { LOG_ERROR("audio_vae_decode failed"); tensor_free(waveform); return err; }
 
-    // ─── Step 11: Copy to VoxCPMAudio ───────────────────────
+    // ─── Step 11: Normalize audio (peak to [-1, 1]) ─────────
+    audio_normalize(waveform);
+
+    // ─── Step 12: Copy to VoxCPMAudio ───────────────────────
     output->num_samples = total_samples;
     output->sample_rate = model->config.sample_rate;
     output->samples = (float*)malloc((size_t)total_samples * sizeof(float));

@@ -425,11 +425,14 @@ cleanup:
 }
 
 /* ═════════════════════════════════════════════════════════════════
- * loc_dit_sample — DDIM diffusion sampling with optional CFG
+ * loc_dit_sample — Flow Matching Euler sampling with optional CFG
  *
  *   Generates a clean latent patch from random noise using
- *   DDIM (deterministic) denoising with cosine noise schedule.
+ *   Conditional Flow Matching (CFM) with Euler ODE solver.
  *   Supports classifier-free guidance (CFG).
+ *
+ *   The model predicts the velocity field v(x_t, t).
+ *   Euler step: x_{t+dt} = x_t + dt * v_pred  (dt < 0 for reverse)
  * ═════════════════════════════════════════════════════════════════ */
 VoxCPMError loc_dit_sample(
     const LocDiT* dit,
@@ -498,28 +501,29 @@ VoxCPMError loc_dit_sample(
 
     VoxCPMError err = VOXCPM_SUCCESS;
 
-    /* DDIM noise schedule: cosine schedule over T=1000 steps
-     *   alpha_bar(t)  = cos(pi/2 * t/T)^2
-     *   sqrt(alpha)   = cos(pi/2 * t/T)
-     *   sqrt(1-alpha) = sin(pi/2 * t/T)
+    /* ─── Flow Matching Euler ODE solver ───
+     *
+     * Timesteps go uniformly from t=1.0 (noise) down to t=sigma_min (near data).
+     * The model predicts the velocity field v = dx/dt.
+     * Euler reverse step: x_{t+dt} = x_t + dt * v_pred, with dt < 0.
+     *
+     * Config: cfm_config.sigma_min = 1e-6, solver = "euler", t_scheduler = "log-norm"
+     * Here we use a uniform t schedule for simplicity (log-norm would skew toward
+     * low-noise regions; uniform is a safe default for Euler).
      */
-    const float T_total = 1000.0f;
-    const float step    = T_total / (float)n_timesteps;
+    const float sigma_min = 1e-6f;
+    const float dt = -(1.0f - sigma_min) / (float)n_timesteps;  /* negative, reverse */
 
     for (int i = 0; i < n_timesteps; i++) {
-        /* Current and next timestep values (decreasing) */
-        float t_val       = T_total - 1.0f - (float)i * step;
-        float t_next_val  = t_val - step;
-        if (t_val      < 0.0f) t_val      = 0.0f;
-        if (t_next_val < 0.0f) t_next_val = 0.0f;
+        float t_cur = 1.0f + (float)i * dt;  /* decreases: 1.0, 0.9, ..., sigma_min+dt */
 
-        /* Fill timestep tensors (dt = positive step size) */
+        /* Fill timestep tensors */
         for (int b = 0; b < B; b++) {
-            t_tensor->data[b]  = t_val;
-            dt_tensor->data[b] = step;
+            t_tensor->data[b]  = t_cur;
+            dt_tensor->data[b] = dt;    /* negative — tells model we're reversing */
         }
 
-        /* ─── Conditional prediction (x0_pred) ─── */
+        /* ─── Conditional velocity prediction ─── */
         err = loc_dit_forward(dit, x_t, mu, cond, t_tensor, dt_tensor, pred);
         if (err) {
             LOG_ERROR("loc_dit_sample: forward failed at step %d/%d", i, n_timesteps);
@@ -535,48 +539,20 @@ VoxCPMError loc_dit_sample(
                 goto cleanup_sample;
             }
 
-            /* CFG combine: pred = uncond + cfg * (cond - uncond) */
+            /* CFG combine on velocity field: v = v_uncond + cfg * (v_cond - v_uncond) */
             for (size_t j = 0; j < pred->size; j++) {
-                float cond_p = pred->data[j];
-                float uncond_p = pred_un->data[j];
-                pred->data[j] = uncond_p + cfg_value * (cond_p - uncond_p);
+                float v_cond   = pred->data[j];
+                float v_uncond = pred_un->data[j];
+                pred->data[j] = v_uncond + cfg_value * (v_cond - v_uncond);
             }
         }
 
-        /* ─── DDIM reverse step ───
-         *
-         * Cosine schedule at timestep t:
-         *   sqrt(alpha_bar(t))  = a(t) = cos(pi/2 * t/T)
-         *   sqrt(1-alpha_bar(t)) = b(t) = sin(pi/2 * t/T)
-         *
-         * Model predicts x0 (denoised).
-         * Implied noise: eps = (x_t - a(t) * x0_pred) / b(t)
-         *
-         * DDIM update (x0-pred formulation):
-         *   x_{t-1} = a(t-1) * x0_pred + b(t-1) * eps
-         *           = a_next * x0p + b_next * (x_t - a_cur * x0p) / b_cur
+        /* ─── Euler reverse step ───
+         *   x_{t+dt} = x_t + dt * v_pred
+         *   dt < 0, so this moves from noise toward data.
          */
-        {
-            float a_cur = cosf(0.5f * (float)M_PI * t_val / T_total);
-            float a_next = cosf(0.5f * (float)M_PI * t_next_val / T_total);
-            float b_cur = sinf(0.5f * (float)M_PI * t_val / T_total);
-            float b_next = sinf(0.5f * (float)M_PI * t_next_val / T_total);
-
-            for (size_t j = 0; j < x_t->size; j++) {
-                float x0p = pred->data[j];
-                float xt  = x_t->data[j];
-
-                /* Derived noise prediction (avoid division by zero) */
-                float eps_pred;
-                if (b_cur > 1e-8f) {
-                    eps_pred = (xt - a_cur * x0p) / b_cur;
-                } else {
-                    eps_pred = 0.0f;
-                }
-
-                /* x_{t-1} = a_next * x0p + b_next * eps_pred */
-                x_next->data[j] = a_next * x0p + b_next * eps_pred;
-            }
+        for (size_t j = 0; j < x_t->size; j++) {
+            x_next->data[j] = x_t->data[j] + dt * pred->data[j];
         }
 
         /* Swap x_t and x_next for next iteration */
