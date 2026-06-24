@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '.gitignore'
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  ###########################################################################
+  # Linux (GCC + Clang)
+  ###########################################################################
+  linux:
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+        quant: [OFF, ON]
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake build-essential \
+            ${{ matrix.compiler == 'gcc' && 'gcc-12 g++-12' || 'clang-15 libc++-15-dev' }}
+
+      - name: Configure CMake
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DCMAKE_C_COMPILER=${{ matrix.compiler == 'gcc' && 'gcc-12' || 'clang-15' }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler == 'gcc' && 'g++-12' || 'clang++-15' }}
+          -DVOXCPM_CUDA=OFF
+          -DVOXCPM_QUANT=${{ matrix.quant }}
+
+      - name: Build
+        run: cmake --build build -j$(nproc) --verbose
+
+      - name: Test
+        run: |
+          if [ -f build/tests/test_runner ]; then
+            ctest --test-dir build --output-on-failure --timeout 60
+          else
+            echo "No test runner found, skipping."
+          fi
+
+      - name: Lint (clang-tidy)
+        if: matrix.compiler == 'clang'
+        run: |
+          if command -v clang-tidy-15 &> /dev/null; then
+            find src/ include/ -name '*.c' -o -name '*.h' | xargs clang-tidy-15 --format-style=file 2>/dev/null || true
+          fi
+
+  ###########################################################################
+  # macOS (Apple Clang)
+  ###########################################################################
+  macos:
+    runs-on: macos-14
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install dependencies
+        run: brew install cmake
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DVOXCPM_CUDA=OFF \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+
+      - name: Build
+        run: cmake --build build -j$(sysctl -n hw.logicalcpu)
+
+      - name: Test
+        run: |
+          if [ -f build/tests/test_runner ]; then
+            ctest --test-dir build --output-on-failure --timeout 60
+          else
+            echo "No test runner found, skipping."
+          fi
+
+  ###########################################################################
+  # Windows (MSVC)
+  ###########################################################################
+  windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DVOXCPM_CUDA=OFF
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Test
+        run: |
+          if (Test-Path "build/tests/${{ env.BUILD_TYPE }}/test_runner.exe") {
+            ctest --test-dir build --output-on-failure --timeout 60 -C ${{ env.BUILD_TYPE }}
+          } else {
+            Write-Host "No test runner found, skipping."
+          }
+
+  ###########################################################################
+  # Code Quality
+  ###########################################################################
+  codeql:
+    if: github.repository != ''
+    runs-on: ubuntu-22.04
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+      - uses: github/codeql-action/analyze@v3
+
+  ###########################################################################
+  # Valgrind (Memory Safety)
+  ###########################################################################
+  valgrind:
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake valgrind
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug -DVOXCPM_CUDA=OFF
+          cmake --build build -j$(nproc)
+      - name: Valgrind
+        run: |
+          if [ -f build/tests/test_runner ]; then
+            valgrind --leak-check=full --error-exitcode=1 \
+              build/tests/test_runner 2>&1 | tail -20
+          else
+            echo "No test runner, skipping valgrind."
+          fi
