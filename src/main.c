@@ -70,7 +70,7 @@ static CLIOptions default_options(void) {
     opts.cmd = CMD_TTS;
     opts.cfg_value = 2.0f;
     opts.steps = 10;
-    opts.max_new_tokens = 4;
+    opts.max_new_tokens = 1024;
     opts.threads = 4;
     opts.seed = 0;
     opts.use_gpu = false;
