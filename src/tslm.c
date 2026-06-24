@@ -102,7 +102,6 @@ VoxCPMError tslm_forward(TSLM* tslm, const Tensor* x,
                           const Tensor* freqs_cis, Tensor* out)
 {
     // ─── Input validation ─────────────────────────────────────────
-    LOG_INFO("TRACE tslm_forward ENTER");
     if (!tslm || !x || !out) {
         LOG_ERROR("tslm_forward: NULL input");
         return VOXCPM_ERR_INTERNAL;
@@ -191,14 +190,8 @@ VoxCPMError tslm_forward(TSLM* tslm, const Tensor* x,
     Tensor*     cur   = buf1;
     Tensor*     nxt   = buf2;
 
-    LOG_INFO("TRACE tslm: %d layers, pos=%d, seq=%d, batch=%d, d_model=%d, max_seq_len=%d, cache_k shape=[%d,%d,%d,%d,%d]",
-             n_layers, pos, seq, batch, d_model, max_seq_len,
-             tslm->cache_k->shape[0], tslm->cache_k->shape[1], tslm->cache_k->shape[2],
-             tslm->cache_k->shape[3], tslm->cache_k->shape[4]);
-
     // ─── Layer loop ───────────────────────────────────────────────
     for (int i = 0; i < n_layers; i++) {
-        if (i < 4) LOG_INFO("TRACE tslm: layer loop top i=%d", i);
         // Create non-owning 4D cache slice views for this layer
         Tensor* layer_k = layer_cache_slice(
             tslm->cache_k, i, batch, n_kv_heads, max_seq_len, head_dim);
@@ -212,29 +205,14 @@ VoxCPMError tslm_forward(TSLM* tslm, const Tensor* x,
             LOG_ERROR("tslm_forward: OOM for layer %d cache slice", i);
             break;
         }
-        if (i < 4) {
-        LOG_INFO("TRACE tslm: cache slices created for layer %d k=%p v=%p k_shape=[%d,%d,%d,%d] layer_size=%zu",
-                 i, (void*)layer_k, (void*)layer_v,
-                 layer_k->shape[0], layer_k->shape[1], layer_k->shape[2], layer_k->shape[3],
-                 (size_t)batch * (size_t)n_kv_heads * (size_t)max_seq_len * (size_t)head_dim);
-    }
 
-        if (i < 4) LOG_INFO("TRACE tslm: entering transformer_block_forward layer %d", i);
-
-        // Forward through the transformer block.
-        // cur (input) -> nxt (output after attention + FFN + residuals)
         err = transformer_block_forward(
             &tslm->layers[i], cur, layer_k, layer_v,
             mask, freqs_cis, pos, nxt);
 
-        LOG_INFO("TRACE tslm: layer %d returned err=%d", i, err);
-
-        // Free cache slice views (non-owning; does not free the actual cache data)
-        LOG_INFO("TRACE tslm: freeing layer %d cache slices k=%p v=%p", i, (void*)layer_k, (void*)layer_v);
+        // Free cache slice views (non-owning; does not free actual cache data)
         tensor_free(layer_k);
-        LOG_INFO("TRACE tslm: freed layer %d k slice", i);
         tensor_free(layer_v);
-        LOG_INFO("TRACE tslm: freed layer %d v slice", i);
 
         if (err != VOXCPM_SUCCESS) {
             LOG_ERROR("tslm_forward: transformer_block_forward "
@@ -242,17 +220,10 @@ VoxCPMError tslm_forward(TSLM* tslm, const Tensor* x,
             break;
         }
 
-        // Check for NaN after each layer
-        { float sum=0; int nn=0; int N = (int)nxt->size > 100 ? 100 : (int)nxt->size;
-          for(int j=0;j<N;j++){float v=nxt->data[j];sum+=fabsf(v);if(isnan(v))nn++;}
-          LOG_INFO("tslm layer %d: sum|fabs(100)|=%f NaN=%d", i, sum, nn); }
-
         // Swap buffers for next layer
-        LOG_INFO("TRACE tslm: swapping buffers for layer %d cur=%p nxt=%p", i, (void*)cur, (void*)nxt);
         Tensor* tmp = cur;
         cur = nxt;
         nxt = tmp;
-        LOG_INFO("TRACE tslm: swapped done for layer %d cur=%p nxt=%p", i, (void*)cur, (void*)nxt);
     }
 
     // ─── Final output norm ────────────────────────────────────────

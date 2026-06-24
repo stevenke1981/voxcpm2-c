@@ -703,8 +703,6 @@ VoxCPMError audio_vae_decode(
     int batch = latent->shape[0];
     int time  = latent->shape[1];
     int dim   = latent->shape[2];
-    LOG_INFO("VAE decode input: latent [%d,%d,%d]", batch, time, dim);
-
     if (dim != vae->latent_dim) {
         LOG_ERROR("VAE V02: dim=%d != latent_dim=%d", dim, vae->latent_dim);
         return VOXCPM_ERR_SHAPE_MISMATCH;
@@ -743,12 +741,6 @@ VoxCPMError audio_vae_decode(
         int T_out = (T_in + 2 * vae->decoder->conv_in->padding
                      - vae->decoder->conv_in->kernel_size)
                     / vae->decoder->conv_in->stride + 1;
-        LOG_INFO("VAE conv_in: in=[%d,%d,%d] kernel=%d stride=%d pad=%d out_c=%d T_out=%d",
-                 batch, vae->latent_dim, T_in,
-                 vae->decoder->conv_in->kernel_size,
-                 vae->decoder->conv_in->stride,
-                 vae->decoder->conv_in->padding,
-                 out_c, T_out);
         Tensor* conv_out = tensor_create(3, (int[]){batch, out_c, T_out});
         if (!conv_out) { err = VOXCPM_ERR_OOM; goto cleanup; }
 
@@ -756,9 +748,6 @@ VoxCPMError audio_vae_decode(
         tensor_free(h);
         h = conv_out;
         if (err) { LOG_ERROR("VAE P02: wnconv_forward conv_in failed"); goto cleanup; }
-
-        LOG_INFO("  conv_in done: [%d, %d, %d] -> [%d, %d, %d]",
-                  batch, dim, T_in, batch, out_c, T_out);
     }
 
     /* Step 3: proj_up — [B, 64, T] -> [B, 2048, T] */
@@ -790,13 +779,8 @@ VoxCPMError audio_vae_decode(
             goto cleanup;
         }
 
-        int prev_time = h->shape[2];
-        int prev_ch   = h->shape[1];
         err = decoder_block_forward(blk, &h);
         if (err) { LOG_ERROR("VAE P05: decoder_block_forward block %d failed", i); goto cleanup; }
-
-        LOG_INFO("VAE decoder_block[%d]: %d -> %d channels, %d -> %d time",
-                  i, prev_ch, blk->convtr->out_channels, prev_time, h->shape[2]);
     }
 
     /* Step 5: Snake before conv_out */
@@ -812,12 +796,6 @@ VoxCPMError audio_vae_decode(
         int T_out = (T_in + 2 * vae->decoder->conv_out->padding
                      - vae->decoder->conv_out->kernel_size)
                     / vae->decoder->conv_out->stride + 1;
-        LOG_INFO("VAE conv_out: in=[%d,%d,%d] kernel=%d stride=%d pad=%d T_out=%d",
-                 batch, out_c, T_in,
-                 vae->decoder->conv_out->kernel_size,
-                 vae->decoder->conv_out->stride,
-                 vae->decoder->conv_out->padding,
-                 T_out);
         Tensor* conv_out = tensor_create(3, (int[]){batch, out_c, T_out});
         if (!conv_out) { err = VOXCPM_ERR_OOM; goto cleanup; }
 

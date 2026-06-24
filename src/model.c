@@ -147,13 +147,9 @@ VoxCPMError voxcpm_audio_save(const VoxCPMAudio* audio, const char* path) {
     if (!audio || !path) return VOXCPM_ERR_INTERNAL;
     if (!audio->samples || audio->num_samples <= 0) return VOXCPM_ERR_INVALID_AUDIO;
 
-    LOG_INFO("voxcpm_audio_save: num_samples=%d path=%s", audio->num_samples, path);
-
     // WAV file header writing
-    // TODO: Move to audio.c once available
     FILE* f = fopen(path, "wb");
     if (!f) return VOXCPM_ERR_FILE_NOT_FOUND;
-    LOG_INFO("WAV file opened: %s", path);
     int sample_rate = audio->sample_rate > 0 ? audio->sample_rate : 48000;
     int bits_per_sample = 16;
     int channels = 1;
@@ -195,7 +191,6 @@ VoxCPMError voxcpm_audio_save(const VoxCPMAudio* audio, const char* path) {
     }
 
     fclose(f);
-    LOG_INFO("WAV file closed: %s", path);
     return VOXCPM_SUCCESS;
 }
 
@@ -434,40 +429,27 @@ VoxCPMModel* voxcpm_create(const VoxCPMModelConfig* config, VoxCPMError* err) {
 
 void voxcpm_free(VoxCPMModel* model) {
     if (!model) return;
-    LOG_INFO("voxcpm_free: freeing sub-models");
 
-    // Free sub-models
-    loc_enc_free(model->loc_enc);          LOG_INFO("  loc_enc freed");
-    tslm_free(model->tslm);               LOG_INFO("  tslm freed");
-    ralm_free(model->ralm);               LOG_INFO("  ralm freed");
-    loc_dit_free(model->loc_dit);          LOG_INFO("  loc_dit freed");
-    audio_vae_free(model->audio_vae);     LOG_INFO("  audio_vae freed");
-    tensor_free(model->text_embed);       LOG_INFO("  text_embed freed");
-    tensor_free(model->audio_embed);      LOG_INFO("  audio_embed freed");
-    tensor_free(model->lm_to_dit_weight); LOG_INFO("  lm_to_dit_weight freed");
-    tensor_free(model->lm_to_dit_bias);   LOG_INFO("  lm_to_dit_bias freed");
-    tensor_free(model->freqs_cis);        LOG_INFO("  freqs_cis freed");
-
-    // Free weight index
-    weight_index_free(model->weight_index);   LOG_INFO("  weight_index freed");
+    loc_enc_free(model->loc_enc);
+    tslm_free(model->tslm);
+    ralm_free(model->ralm);
+    loc_dit_free(model->loc_dit);
+    audio_vae_free(model->audio_vae);
+    tensor_free(model->text_embed);
+    tensor_free(model->audio_embed);
+    tensor_free(model->lm_to_dit_weight);
+    tensor_free(model->lm_to_dit_bias);
+    tensor_free(model->freqs_cis);
+    weight_index_free(model->weight_index);
     model->weight_index = NULL;
-
-    // Free AudioVAE weight files (separate companion)
-    weight_index_free(model->audiovae_index); LOG_INFO("  audiovae_index freed");
+    weight_index_free(model->audiovae_index);
     model->audiovae_index = NULL;
-    mmap_close(model->audiovae_mmap);    LOG_INFO("  audiovae_mmap closed");
-
-    // Close main weight file
-    mmap_close(model->weights_mmap);     LOG_INFO("  weights_mmap closed");
-
-    // Free thread pool
-    thread_pool_free(model->thread_pool); LOG_INFO("  thread_pool freed");
-
-    // Free tokenizer
-    tokenizer_free(model->tokenizer);    LOG_INFO("  tokenizer freed");
+    mmap_close(model->audiovae_mmap);
+    mmap_close(model->weights_mmap);
+    thread_pool_free(model->thread_pool);
+    tokenizer_free(model->tokenizer);
     model->tokenizer = NULL;
-
-    free(model);                         LOG_INFO("  model freed");
+    free(model);
 }
 
 char* voxcpm_model_info(const VoxCPMModel* model) {
@@ -597,21 +579,6 @@ VoxCPMError voxcpm_generate(
     }
     free(tokens);
 
-    { // Full NaN scan of embed weight (at least first 100K)
-        int en=0; int first_e=-1; int c = (int)fminf(100000.0f, (float)embed->size);
-        for(int i=0;i<c;i++){if(isnan(embed->data[i])){en++;if(first_e<0)first_e=i;}}
-        LOG_INFO("Embed weight[%d]: NaN=%d first_nan_at=%d (vocab=%d d=%d)",
-                 c, en, first_e, embed->shape[0], embed->shape[1]);
-        // Full NaN scan of hidden
-        int hn=0; int first_h=-1;
-        for(int i=0;i<(int)hidden->size;i++){if(isnan(hidden->data[i])){hn++;if(first_h<0)first_h=i;}}
-        // Show which token produced the NaN
-        int first_h_token = -1; int first_h_dim = -1;
-        if (first_h >= 0) { first_h_token = first_h / (int)D; first_h_dim = first_h % (int)D; }
-        LOG_INFO("Hidden: size=%d NaN=%d first_nan_at=%d (token=%d dim=%d) first5=[%.4f,%.4f,%.4f,%.4f,%.4f]",
-                 (int)hidden->size, hn, first_h, first_h_token, first_h_dim,
-                 hidden->data[0],hidden->data[1],hidden->data[2],hidden->data[3],hidden->data[4]);
-    }
     // ─── Step 3: Setup KV caches ────────────────────────────
     // Use a smaller max_seq_len for KV cache to avoid OOM from heap fragmentation.
     // TTS only needs a few hundred tokens; 2048 is more than generous.
@@ -640,34 +607,9 @@ VoxCPMError voxcpm_generate(
     // ─── Step 4: TSLM prefill ───────────────────────────────
     Tensor* freqs_cis = model->freqs_cis;
 
-    { // Full NaN scan of TSLM input
-        int total_nan=0; float total_sum=0; int N=(int)hidden->size;
-        int first_nan_pos=-1;
-        for(int i=0;i<N;i++){float v=hidden->data[i];total_sum+=fabsf(v);if(isnan(v)){total_nan++;if(first_nan_pos<0)first_nan_pos=i;}}
-        LOG_INFO("TSLM input: size=%d sum|fabs|=%f NaN_total=%d first_nan_at=%d first5=[%.4f,%.4f,%.4f,%.4f,%.4f]",
-                 N, total_sum, total_nan, first_nan_pos,
-                 hidden->data[0],hidden->data[1],hidden->data[2],hidden->data[3],hidden->data[4]);
-        // Also check what p=2,d=0 looks like (prefix index 2, dim 0)
-        if (first_nan_pos >= 0) {
-            int p = first_nan_pos / 2048;
-            int d = first_nan_pos % 2048;
-            LOG_INFO("  first NaN at flat=%d p=%d d=%d, p=2 first10_dims=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]",
-                     first_nan_pos, p, d,
-                     hidden->data[2*2048], hidden->data[2*2048+1], hidden->data[2*2048+2],
-                     hidden->data[2*2048+3], hidden->data[2*2048+4], hidden->data[2*2048+5],
-                     hidden->data[2*2048+6], hidden->data[2*2048+7], hidden->data[2*2048+8],
-                     hidden->data[2*2048+9]);
-        }
-    }
     LOG_INFO("TSLM forward: hidden [%d,%d,%d]...", B, n_tokens, D);
     err = tslm_forward(model->tslm, hidden, freqs_cis, hidden);
     if (err) { LOG_ERROR("tslm_forward failed: err=%d", err); tensor_free(hidden); return err; }
-    LOG_INFO("TSLM forward done");
-    { // Check after TSLM
-        float sum=0; int nn=0; for(int i=0;i< (int)hidden->size && i<50;i++){float v=hidden->data[i];sum+=fabsf(v);if(isnan(v))nn++;}
-        LOG_INFO("After TSLM: sum|first50|=%f NaN=%d first5=[%.4f,%.4f,%.4f,%.4f,%.4f]",
-                 sum, nn, hidden->data[0],hidden->data[1],hidden->data[2],hidden->data[3],hidden->data[4]);
-    }
 
     // ─── Step 5: RALM forward (residual) ────────────────────
     if (model->ralm) {
@@ -677,12 +619,6 @@ VoxCPMError voxcpm_generate(
         LOG_INFO("RALM forward...");
         err = ralm_forward(model->ralm, hidden, NULL, ralm_out);
         if (err) { LOG_ERROR("ralm_forward failed: err=%d", err); tensor_free(hidden); tensor_free(ralm_out); return err; }
-        LOG_INFO("RALM forward done");
-        { // Check after RALM
-            float sum=0; int nn=0; for(int i=0;i< (int)ralm_out->size && i<50;i++){float v=ralm_out->data[i];sum+=fabsf(v);if(isnan(v))nn++;}
-            LOG_INFO("After RALM: sum|first50|=%f NaN=%d first5=[%.4f,%.4f,%.4f,%.4f,%.4f]",
-                     sum, nn, ralm_out->data[0],ralm_out->data[1],ralm_out->data[2],ralm_out->data[3],ralm_out->data[4]);
-        }
 
         // Add residual: hidden += ralm_out
         err = tensor_add(hidden, ralm_out, hidden);
@@ -742,15 +678,6 @@ VoxCPMError voxcpm_generate(
 
     // ─── Step 9: Permute latent for AudioVAE ────────────────
     // latent: [B, F, P] → [B, P, F] (time-major for AudioVAE)
-    { // Check latent values
-        float sum = 0.0f; int nz = 0;
-        int N = (int)latent->size;
-        for (int i = 0; i < N && i < 1000; i++) { float v = latent->data[i]; sum += fabsf(v); if (v != 0.0f) nz++; }
-        LOG_INFO("latent after loc_dit: shape=[%d,%d,%d] total=%d sum|first1000|=%f nonzero=%d/%d first5=[%.4f,%.4f,%.4f,%.4f,%.4f]",
-                 latent->shape[0], latent->shape[1], latent->shape[2], N, sum, nz, N,
-                 N>0?latent->data[0]:0, N>1?latent->data[1]:0, N>2?latent->data[2]:0,
-                 N>3?latent->data[3]:0, N>4?latent->data[4]:0);
-    }
     Tensor* latent_vae = tensor_create(3, (int[]){ B, P, F });
     if (!latent_vae) { tensor_free(latent); return VOXCPM_ERR_OOM; }
 
@@ -767,22 +694,18 @@ VoxCPMError voxcpm_generate(
     int total_samples = P * 1920; // fallback
     if (model->audio_vae && model->audio_vae->decoder) {
         AudioVAEDecoder* dec = model->audio_vae->decoder;
-        int T = P; // latent time frames
+        int T = P;
         for (int i = 0; i < AUDIOVAE_NUM_DECODER_BLOCKS; i++) {
             const WNConv* ct = dec->decoder_blocks[i].convtr;
             T = (T - 1) * ct->stride - 2 * ct->padding + ct->kernel_size;
         }
         total_samples = T;
-        LOG_INFO("VAE output size: P=%d total_samples=%d", P, total_samples);
     }
 
     Tensor* waveform = tensor_create(1, (int[]){ B * total_samples });
     if (!waveform) { tensor_free(latent_vae); return VOXCPM_ERR_OOM; }
 
     if (model->audio_vae) {
-        LOG_INFO("Calling audio_vae_decode with latent [%d,%d,%d] waveform [%d]",
-                 latent_vae->shape[0], latent_vae->shape[1], latent_vae->shape[2],
-                 waveform->shape[0]);
         err = audio_vae_decode(model->audio_vae, latent_vae, waveform);
     } else {
         tensor_zero(waveform);
@@ -790,7 +713,6 @@ VoxCPMError voxcpm_generate(
     }
     tensor_free(latent_vae);
     if (err) { LOG_ERROR("audio_vae_decode failed"); tensor_free(waveform); return err; }
-    LOG_INFO("VAE decode done (total_samples=%d)", total_samples);
 
     // ─── Step 11: Copy to VoxCPMAudio ───────────────────────
     output->num_samples = total_samples;
@@ -798,10 +720,8 @@ VoxCPMError voxcpm_generate(
     output->samples = (float*)malloc((size_t)total_samples * sizeof(float));
     if (!output->samples) { tensor_free(waveform); return VOXCPM_ERR_OOM; }
     memcpy(output->samples, waveform->data, (size_t)total_samples * sizeof(float));
-    LOG_INFO("Copied %d samples to output", total_samples);
 
     tensor_free(waveform);
-    LOG_INFO("voxcpm_generate returning VOXCPM_SUCCESS");
     return VOXCPM_SUCCESS;
 }
 
@@ -1407,9 +1327,8 @@ WeightIndex* weight_index_build(const uint8_t* data, size_t data_size) {
     *(uint32_t*)(header_copy + 60) = 0;
     uint32_t calc_crc = crc32c_compute(header_copy, VXCPM_HEADER_SIZE, 0);
     if (calc_crc != header->header_checksum) {
-        LOG_ERROR("Header CRC mismatch: stored=0x%08X calc=0x%08X",
+        LOG_WARN("Header CRC mismatch: stored=0x%08X calc=0x%08X (non-fatal)",
                   header->header_checksum, calc_crc);
-        /* Non-fatal: continue anyway */
     }
 
     uint32_t num_tensors = header->num_tensors;
@@ -1450,8 +1369,6 @@ WeightIndex* weight_index_build(const uint8_t* data, size_t data_size) {
      * points to the LAST NULL BYTE of the string table (name_length excludes null terminator).
      * Tensor data starts AFTER that null byte. */
     size_t data_start = string_table_offset + max_name_end + 1;
-    LOG_INFO("string_table_offset=%zu max_name_end=%zu data_start=%zu",
-             string_table_offset, max_name_end, data_start);
 
     /* Second pass: fill entries with correct data_offset (file order) */
     {
@@ -1630,16 +1547,7 @@ VoxCPMError weight_load_tensor(
         }
     }
 
-    /* Sample: print first 5 values if tensor has ≤2048 elements or name contains "layernorm" */
-    if (num_elems <= 2048 || strstr(entry->name, "layernorm") || strstr(entry->name, "embed")) {
-        LOG_INFO("WEIGHT '%s': dtype=%d offset=%llu size=%lld first5=[%.6f,%.6f,%.6f,%.6f,%.6f] all_zero=%d",
-                 entry->name, entry->dtype, (unsigned long long)entry->data_offset,
-                 (long long)num_elems,
-                 t->data[0], t->data[1], t->data[2], t->data[3], t->data[4],
-                 (t->data[0]==0&&t->data[1]==0&&t->data[2]==0&&t->data[3]==0&&t->data[4]==0)?1:0);
-    }
-
-    /* Clamp NaN to zero — model may contain spurious NaN from FP16/BF16 conversion */
+    /* Clamp NaN to zero — safety net for edge cases in FP16/BF16 conversion */
     {
         int nan_count = 0;
         for (int64_t i = 0; i < num_elems; i++) {

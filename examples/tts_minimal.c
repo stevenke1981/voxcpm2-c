@@ -57,8 +57,6 @@ int main(int argc, char** argv) {
 
     fflush(stdout);
     voxcpm_audio_free(&audio);
-    fprintf(stderr, "audio freed OK\n");
     voxcpm_free(model);
-    fprintf(stderr, "model freed OK\n");
     return 0;
 }

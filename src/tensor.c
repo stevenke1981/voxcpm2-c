@@ -690,19 +690,11 @@ VoxCPMError tensor_rms_norm(
     for (int p = 0; p < prefix; p++) {
         // Compute RMS: sqrt(mean(x^2))
         double sum_sq = 0.0;
-        int nan_found = 0;
         for (int d = 0; d < d_model; d++) {
             size_t idx = (size_t)p * d_model + (size_t)d;
             float v = x->data[idx];
-            if (isnan(v)) { nan_found = 1; v = 0.0f; }
+            if (isnan(v)) v = 0.0f; /* safety: treat NaN as zero */
             sum_sq += (double)v * (double)v;
-        }
-        if (nan_found) {
-            fprintf(stderr, "RMS norm NaN input at p=%d (prefix=%d d_model=%d) first5=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                    p, prefix, d_model,
-                    x->data[p * d_model], x->data[p * d_model + 1],
-                    x->data[p * d_model + 2], x->data[p * d_model + 3],
-                    x->data[p * d_model + 4]);
         }
         double rms = sqrt(sum_sq / (double)d_model + (double)eps);
         double inv_rms = 1.0 / rms;

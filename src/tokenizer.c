@@ -658,7 +658,7 @@ Tokenizer* tokenizer_create_from_file(const char* path) {
     int merge_skip_count = 0;
     for (int i = 0; i < num_merges; i++) {
         if (i % 10000 == 0)
-            LOG_INFO("tokenizer merges: %d/%d (inserted=%d skipped=%d)",
+            LOG_DEBUG("tokenizer merges: %d/%d (inserted=%d skipped=%d)",
                      i, num_merges, merge_insert_count, merge_skip_count);
         if (offset + 16 > file_size) {
             LOG_ERROR("tokenizer_create_from_file: truncated at merge[%d]", i);
