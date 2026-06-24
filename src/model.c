@@ -1446,7 +1446,12 @@ WeightIndex* weight_index_build(const uint8_t* data, size_t data_size) {
         size_t name_end = (size_t)meta->name_offset + (size_t)meta->name_length;
         if (name_end > max_name_end) max_name_end = name_end;
     }
-    size_t data_start = string_table_offset + max_name_end;
+    /* data_start must be max_name_end + 1 because max_name_end = max(name_offset + name_length)
+     * points to the LAST NULL BYTE of the string table (name_length excludes null terminator).
+     * Tensor data starts AFTER that null byte. */
+    size_t data_start = string_table_offset + max_name_end + 1;
+    LOG_INFO("string_table_offset=%zu max_name_end=%zu data_start=%zu",
+             string_table_offset, max_name_end, data_start);
 
     /* Second pass: fill entries with correct data_offset (file order) */
     {
