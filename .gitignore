@@ -46,3 +46,27 @@ output*.txt
 output*.wav
 # vscode launch
 launch.json
+
+# OpenCode workflow config
+.opencode/
+AGENTS.md
+TEAM-C.md
+
+# OpenCode workflow artifacts
+spec.md
+plan.md
+todos.md
+final.md
+rollback.md
+acceptance_report.md
+traceability_matrix.md
+test.md
+
+# Tokenizer binary (large, use Git LFS if needed)
+models/tokenizer.bin
+
+# Benchmark output data (not source)
+benchmarks/*.csv
+benchmarks/*.json
+benchmarks/*.log
+benchmarks/out_*/
