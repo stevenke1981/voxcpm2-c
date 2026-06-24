@@ -628,6 +628,7 @@ VoxCPMError transformer_block_forward(
         LOG_ERROR("transformer_block_forward: rms_norm_forward (attn) failed");
         goto cleanup;
     }
+    {float s=0;int n=0;for(int i=0;i<100;i++){float v=normed->data[i];s+=fabsf(v);if(isnan(v))n++;} LOG_INFO("tbf N01 rms_attn: sum=%.2f NaN=%d",s,n);}
 
     // ─────────────────────────────────────────────────────────────
     // Step 3: Multi-head attention
@@ -639,6 +640,7 @@ VoxCPMError transformer_block_forward(
         LOG_ERROR("transformer_block_forward: attention_forward failed");
         goto cleanup;
     }
+    {float s=0;int n=0;for(int i=0;i<100;i++){float v=temp_out->data[i];s+=fabsf(v);if(isnan(v))n++;} LOG_INFO("tbf N02 attn_out: sum=%.2f NaN=%d",s,n);}
 
     // ─────────────────────────────────────────────────────────────
     // Step 4: Residual connection (pre-attention)
@@ -652,6 +654,7 @@ VoxCPMError transformer_block_forward(
         LOG_ERROR("transformer_block_forward: tensor_add (attn residual) failed");
         goto cleanup;
     }
+    {float s=0;int n=0;for(int i=0;i<100;i++){float v=out->data[i];s+=fabsf(v);if(isnan(v))n++;} LOG_INFO("tbf N03 attn_res: sum=%.2f NaN=%d",s,n);}
 
     // ─────────────────────────────────────────────────────────────
     // Step 5-6: Pre-FFN RMS norm
@@ -662,6 +665,7 @@ VoxCPMError transformer_block_forward(
         LOG_ERROR("transformer_block_forward: rms_norm_forward (ffn) failed");
         goto cleanup;
     }
+    {float s=0;int n=0;for(int i=0;i<100;i++){float v=normed->data[i];s+=fabsf(v);if(isnan(v))n++;} LOG_INFO("tbf N04 rms_ffn: sum=%.2f NaN=%d",s,n);}
 
     // ─────────────────────────────────────────────────────────────
     // Step 7: SwiGLU FFN
@@ -672,6 +676,7 @@ VoxCPMError transformer_block_forward(
         LOG_ERROR("transformer_block_forward: swiglu_forward failed");
         goto cleanup;
     }
+    {float s=0;int n=0;for(int i=0;i<100;i++){float v=temp_out->data[i];s+=fabsf(v);if(isnan(v))n++;} LOG_INFO("tbf N05 swiglu: sum=%.2f NaN=%d",s,n);}
 
     // ─────────────────────────────────────────────────────────────
     // Step 8: Residual connection (pre-FFN)
@@ -682,6 +687,7 @@ VoxCPMError transformer_block_forward(
         LOG_ERROR("transformer_block_forward: tensor_add (ffn residual) failed");
         goto cleanup;
     }
+    {float s=0;int n=0;for(int i=0;i<100;i++){float v=out->data[i];s+=fabsf(v);if(isnan(v))n++;} LOG_INFO("tbf N06 ffn_res: sum=%.2f NaN=%d",s,n);}
 
 cleanup:
     tensor_free(normed);

@@ -242,6 +242,11 @@ VoxCPMError tslm_forward(TSLM* tslm, const Tensor* x,
             break;
         }
 
+        // Check for NaN after each layer
+        { float sum=0; int nn=0; int N = (int)nxt->size > 100 ? 100 : (int)nxt->size;
+          for(int j=0;j<N;j++){float v=nxt->data[j];sum+=fabsf(v);if(isnan(v))nn++;}
+          LOG_INFO("tslm layer %d: sum|fabs(100)|=%f NaN=%d", i, sum, nn); }
+
         // Swap buffers for next layer
         LOG_INFO("TRACE tslm: swapping buffers for layer %d cur=%p nxt=%p", i, (void*)cur, (void*)nxt);
         Tensor* tmp = cur;

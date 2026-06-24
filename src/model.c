@@ -597,11 +597,19 @@ VoxCPMError voxcpm_generate(
     }
     free(tokens);
 
-    { // Check embed weight and hidden
-        float esum=0; for(int i=0;i< (int)embed->size && i<100;i++) esum += fabsf(embed->data[i]);
-        float hsum=0; int hn=0; for(int i=0;i< (int)hidden->size && i<100;i++){hsum+=fabsf(hidden->data[i]);if(isnan(hidden->data[i]))hn++;}
-        LOG_INFO("Embed weight[100]: sum|fabs|=%f hidden[100]: sum|fabs|=%f NaN=%d first5_h=[%.4f,%.4f,%.4f,%.4f,%.4f]",
-                 esum, hsum, hn,
+    { // Full NaN scan of embed weight (at least first 100K)
+        int en=0; int first_e=-1; int c = (int)fminf(100000.0f, (float)embed->size);
+        for(int i=0;i<c;i++){if(isnan(embed->data[i])){en++;if(first_e<0)first_e=i;}}
+        LOG_INFO("Embed weight[%d]: NaN=%d first_nan_at=%d (vocab=%d d=%d)",
+                 c, en, first_e, embed->shape[0], embed->shape[1]);
+        // Full NaN scan of hidden
+        int hn=0; int first_h=-1;
+        for(int i=0;i<(int)hidden->size;i++){if(isnan(hidden->data[i])){hn++;if(first_h<0)first_h=i;}}
+        // Show which token produced the NaN
+        int first_h_token = -1; int first_h_dim = -1;
+        if (first_h >= 0) { first_h_token = first_h / (int)D; first_h_dim = first_h % (int)D; }
+        LOG_INFO("Hidden: size=%d NaN=%d first_nan_at=%d (token=%d dim=%d) first5=[%.4f,%.4f,%.4f,%.4f,%.4f]",
+                 (int)hidden->size, hn, first_h, first_h_token, first_h_dim,
                  hidden->data[0],hidden->data[1],hidden->data[2],hidden->data[3],hidden->data[4]);
     }
     // ─── Step 3: Setup KV caches ────────────────────────────
@@ -632,11 +640,24 @@ VoxCPMError voxcpm_generate(
     // ─── Step 4: TSLM prefill ───────────────────────────────
     Tensor* freqs_cis = model->freqs_cis;
 
-    { // Check TSLM input for NaN
-        float sum=0; int nn=0; for(int i=0;i< (int)hidden->size && i<50;i++){float v=hidden->data[i];sum+=fabsf(v);if(isnan(v))nn++;}
-        LOG_INFO("TSLM input: size=%d sum|first50|=%f NaN=%d first5=[%.4f,%.4f,%.4f,%.4f,%.4f]",
-                 (int)hidden->size, sum, nn,
+    { // Full NaN scan of TSLM input
+        int total_nan=0; float total_sum=0; int N=(int)hidden->size;
+        int first_nan_pos=-1;
+        for(int i=0;i<N;i++){float v=hidden->data[i];total_sum+=fabsf(v);if(isnan(v)){total_nan++;if(first_nan_pos<0)first_nan_pos=i;}}
+        LOG_INFO("TSLM input: size=%d sum|fabs|=%f NaN_total=%d first_nan_at=%d first5=[%.4f,%.4f,%.4f,%.4f,%.4f]",
+                 N, total_sum, total_nan, first_nan_pos,
                  hidden->data[0],hidden->data[1],hidden->data[2],hidden->data[3],hidden->data[4]);
+        // Also check what p=2,d=0 looks like (prefix index 2, dim 0)
+        if (first_nan_pos >= 0) {
+            int p = first_nan_pos / 2048;
+            int d = first_nan_pos % 2048;
+            LOG_INFO("  first NaN at flat=%d p=%d d=%d, p=2 first10_dims=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]",
+                     first_nan_pos, p, d,
+                     hidden->data[2*2048], hidden->data[2*2048+1], hidden->data[2*2048+2],
+                     hidden->data[2*2048+3], hidden->data[2*2048+4], hidden->data[2*2048+5],
+                     hidden->data[2*2048+6], hidden->data[2*2048+7], hidden->data[2*2048+8],
+                     hidden->data[2*2048+9]);
+        }
     }
     LOG_INFO("TSLM forward: hidden [%d,%d,%d]...", B, n_tokens, D);
     err = tslm_forward(model->tslm, hidden, freqs_cis, hidden);
@@ -1418,99 +1439,69 @@ WeightIndex* weight_index_build(const uint8_t* data, size_t data_size) {
                                   (size_t)num_tensors * VXCPM_META_ENTRY_SIZE;
     const char* string_table = (const char*)data + string_table_offset;
 
+    /* First pass over meta_array: find where string table ends */
+    size_t max_name_end = 0;
     for (uint32_t i = 0; i < num_tensors; i++) {
         const VxcpmTensorMeta* meta = &meta_array[i];
-
-        /* Read name from string table */
-        const char* name_ptr = string_table + meta->name_offset;
-
-        WeightEntry* entry = &idx->entries[idx->count];
-
-        /* Copy name */
-        size_t name_len = (size_t)meta->name_length;
-        entry->name = (char*)malloc(name_len + 1);
-        if (!entry->name) goto fail;
-        memcpy(entry->name, name_ptr, name_len);
-        entry->name[name_len] = '\0';
-
-        entry->dtype = meta->dtype;
-        entry->ndim = meta->ndim;
-        memcpy(entry->shape, meta->shape, sizeof(uint32_t) * 4);
-
-        /* Compute data offset */
-        uint64_t data_offset = string_table_offset;
-        /* Skip string table (find end) */
-        // We need to scan past all strings to find the data start
-        // Since we don't have string table size stored, compute:
-        // metadata_size + all string bytes
-        // The string table ends when metadata + strings = data_start
-        // We know num_tensors, we know the last tensor data_offset
-        // Actually, let's compute data_size from the header layout
-        // String table is between metadata and tensor data.
-        // We compute the total metadata+string size and then data starts.
-
-        // For the data offset of each tensor, we need to compute cumulative offsets
-        // But for now we don't have the absolute data offsets from the metadata.
-        // Let me fix this: store the data start position.
-
-        // Actually, looking at the format again:
-        // The metadata entries have name_offset pointing into the string table.
-        // Data starts after the string table.
-        // Tensors are stored contiguously in order of metadata entries.
-        // So data offset = offset_of(string_table_end) + cumulative_tensor_size.
-
-        // compute number of elements from shape
-        uint64_t elem_count = 1;
-        for (int d = 0; d < (int)meta->ndim; d++) {
-            elem_count *= (uint64_t)meta->shape[d];
-        }
-        int elem_size = 4; /* default FP32 */
-        switch (meta->dtype) {
-            case VXCPM_DTYPE_BF16:
-            case VXCPM_DTYPE_FP16:  elem_size = 2; break;
-            case VXCPM_DTYPE_FP32:  elem_size = 4; break;
-            case VXCPM_DTYPE_Q4_0:
-            case VXCPM_DTYPE_Q4_1:  elem_size = 0; break; /* variable */
-        }
-        uint64_t raw_size = elem_count * (uint64_t)elem_size;
-
-        /* Store data size for offset computation in second pass */
-        entry->data_size = raw_size;
-
-        /* Fix data offset below after we compute string table size */
-        idx->count++;
+        size_t name_end = (size_t)meta->name_offset + (size_t)meta->name_length;
+        if (name_end > max_name_end) max_name_end = name_end;
     }
+    size_t data_start = string_table_offset + max_name_end;
 
-    /* Second pass: compute string table size and then data offsets */
+    /* Second pass: fill entries with correct data_offset (file order) */
     {
-        /* Find string table end by looking for max (name_offset + name_length) */
-        size_t max_name_end = 0;
-        for (int i = 0; i < idx->count; i++) {
-            const WeightEntry* e = &idx->entries[i];
-            /* We need the name_offset + name_length for each entry */
-            /* We stored the name but lost the original offset/length */
-            /* Let me read from the metadata again */
-        }
-
-        /* Compute string table size: it ends right before the first tensor data */
-        /* String bytes end where all the concatenated null-terminated strings end */
-        /* Parse the metadata array to find the max name_offset + name_length */
-
-        max_name_end = 0;
+        uint64_t cum_offset = (uint64_t)data_start;
         for (uint32_t i = 0; i < num_tensors; i++) {
             const VxcpmTensorMeta* meta = &meta_array[i];
-            size_t name_end = (size_t)meta->name_offset + (size_t)meta->name_length;
-            if (name_end > max_name_end) max_name_end = name_end;
-        }
+            const char* name_ptr = string_table + meta->name_offset;
 
-        size_t string_table_size = max_name_end;
-        size_t data_start = string_table_offset + string_table_size;
+            WeightEntry* entry = &idx->entries[idx->count];
 
-        /* Now compute cumulative data offsets */
-        uint64_t cum_offset = (uint64_t)data_start;
-        for (int i = 0; i < idx->count; i++) {
-            idx->entries[i].data_offset = cum_offset;
-            cum_offset += idx->entries[i].data_size;
+            /* Copy name */
+            size_t name_len = (size_t)meta->name_length;
+            entry->name = (char*)malloc(name_len + 1);
+            if (!entry->name) goto fail;
+            memcpy(entry->name, name_ptr, name_len);
+            entry->name[name_len] = '\0';
+
+            entry->dtype = meta->dtype;
+            entry->ndim = meta->ndim;
+            memcpy(entry->shape, meta->shape, sizeof(uint32_t) * 4);
+
+            /* Compute element count and raw size */
+            uint64_t elem_count = 1;
+            for (int d = 0; d < (int)meta->ndim; d++) {
+                elem_count *= (uint64_t)meta->shape[d];
+            }
+            int elem_size = 4; /* default FP32 */
+            switch (meta->dtype) {
+                case VXCPM_DTYPE_BF16:
+                case VXCPM_DTYPE_FP16:  elem_size = 2; break;
+                case VXCPM_DTYPE_FP32:  elem_size = 4; break;
+                case VXCPM_DTYPE_Q4_0:
+                case VXCPM_DTYPE_Q4_1:  elem_size = 0; break; /* variable */
+            }
+            uint64_t raw_size = elem_count * (uint64_t)elem_size;
+
+            entry->data_size = raw_size;
+            entry->data_offset = cum_offset;
+            cum_offset += raw_size;
+
+            /* Debug: check for gaps (padding) */
+            if (i > 0) {
+                WeightEntry* prev = &idx->entries[i - 1];
+                uint64_t prev_end = prev->data_offset + prev->data_size;
+                if (entry->data_offset != prev_end) {
+                    LOG_WARN("GAP: tensor #%d '%s' start=%llu prev '%s' end=%llu gap=%llu",
+                             i, entry->name,
+                             (unsigned long long)entry->data_offset,
+                             prev->name,
+                             (unsigned long long)prev_end,
+                             (unsigned long long)(entry->data_offset - prev_end));
+                }
+            }
+
+            idx->count++;
         }
     }
 
@@ -1631,6 +1622,26 @@ VoxCPMError weight_load_tensor(
         default: {
             tensor_free(t);
             return VOXCPM_ERR_UNSUPPORTED;
+        }
+    }
+
+    /* Sample: print first 5 values if tensor has ≤2048 elements or name contains "layernorm" */
+    if (num_elems <= 2048 || strstr(entry->name, "layernorm") || strstr(entry->name, "embed")) {
+        LOG_INFO("WEIGHT '%s': dtype=%d offset=%llu size=%lld first5=[%.6f,%.6f,%.6f,%.6f,%.6f] all_zero=%d",
+                 entry->name, entry->dtype, (unsigned long long)entry->data_offset,
+                 (long long)num_elems,
+                 t->data[0], t->data[1], t->data[2], t->data[3], t->data[4],
+                 (t->data[0]==0&&t->data[1]==0&&t->data[2]==0&&t->data[3]==0&&t->data[4]==0)?1:0);
+    }
+
+    /* Clamp NaN to zero — model may contain spurious NaN from FP16/BF16 conversion */
+    {
+        int nan_count = 0;
+        for (int64_t i = 0; i < num_elems; i++) {
+            if (isnan(t->data[i])) { t->data[i] = 0.0f; nan_count++; }
+        }
+        if (nan_count > 0) {
+            LOG_WARN("NaN clamped: '%s' %d NaN (size=%lld)", entry->name, nan_count, (long long)num_elems);
         }
     }
 
