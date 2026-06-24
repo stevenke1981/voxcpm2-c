@@ -35,13 +35,12 @@
  * ═══════════════════════════════════════════════════════════════ */
 static Tensor* layer_cache_slice(Tensor* cache_5d, int layer_idx,
                                   int batch, int n_kv_heads,
-                                  int max_seq_len, int head_dim)
+                                  int head_dim)
 {
     if (!cache_5d) return NULL;
 
     /* Use the cache's actual max_seq_len (shape[3]) for offset computation,
-     * NOT the passed-in max_seq_len which may differ (e.g., after OOM workaround).
-     * This ensures each layer's slice points to the correct memory region. */
+     * rather than a passed-in max_seq_len which may differ (e.g., after OOM workaround). */
     int actual_seq = cache_5d->shape[3];
     size_t layer_size = (size_t)batch * (size_t)n_kv_heads *
                         (size_t)actual_seq * (size_t)head_dim;
@@ -194,9 +193,9 @@ VoxCPMError tslm_forward(TSLM* tslm, const Tensor* x,
     for (int i = 0; i < n_layers; i++) {
         // Create non-owning 4D cache slice views for this layer
         Tensor* layer_k = layer_cache_slice(
-            tslm->cache_k, i, batch, n_kv_heads, max_seq_len, head_dim);
+            tslm->cache_k, i, batch, n_kv_heads, head_dim);
         Tensor* layer_v = layer_cache_slice(
-            tslm->cache_v, i, batch, n_kv_heads, max_seq_len, head_dim);
+            tslm->cache_v, i, batch, n_kv_heads, head_dim);
 
         if (!layer_k || !layer_v) {
             tensor_free(layer_k);
@@ -313,7 +312,6 @@ VoxCPMError tslm_forward_step(TSLM* tslm, const Tensor* x,
 
     int n_layers    = tslm->n_layers;
     int n_kv_heads  = tslm->n_kv_heads;
-    int max_seq_len = tslm->max_seq_len;
     int head_dim    = tslm->head_dim;
 
     // ─── Create 3D views with seq=1 for attention_forward ─────────
@@ -348,9 +346,9 @@ VoxCPMError tslm_forward_step(TSLM* tslm, const Tensor* x,
     for (int i = 0; i < n_layers; i++) {
         // Create non-owning 4D cache slice views for this layer
         Tensor* layer_k = layer_cache_slice(
-            tslm->cache_k, i, batch, n_kv_heads, max_seq_len, head_dim);
+            tslm->cache_k, i, batch, n_kv_heads, head_dim);
         Tensor* layer_v = layer_cache_slice(
-            tslm->cache_v, i, batch, n_kv_heads, max_seq_len, head_dim);
+            tslm->cache_v, i, batch, n_kv_heads, head_dim);
 
         if (!layer_k || !layer_v) {
             tensor_free(layer_k);

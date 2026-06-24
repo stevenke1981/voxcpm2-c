@@ -888,9 +888,6 @@ VoxCPMError tensor_cat(const Tensor* a, const Tensor* b, int axis, Tensor* out) 
     }
 
     // Copy data: first a, then b along the concat axis
-    size_t a_offset = 0;
-    size_t b_offset = (size_t)a->shape[axis];
-
     // Fast path: axis == ndim-1 (contiguous in memory)
     if (axis == a->ndim - 1 || a->ndim == 1) {
         size_t prefix = 1;
