@@ -459,6 +459,18 @@ struct VoxCPMModel {
     Tensor*     lm_to_dit_weight;     /* [dit_hidden, d_model] */
     Tensor*     lm_to_dit_bias;       /* [dit_hidden] */
 
+    /* Encoder → LM projection (audio context) */
+    Tensor*     enc_to_lm_proj_weight;    /* [d_model, enc_hidden] */
+    Tensor*     enc_to_lm_proj_bias;      /* [d_model] */
+
+    /* Residual → DiT projection (for cond from text hidden) */
+    Tensor*     res_to_dit_proj_weight;   /* [dit_hidden, d_model] */
+    Tensor*     res_to_dit_proj_bias;     /* [dit_hidden] */
+
+    /* Fusion: concatenated hidden+enc → hidden */
+    Tensor*     fusion_concat_proj_weight; /* [d_model, d_model*2] */
+    Tensor*     fusion_concat_proj_bias;   /* [d_model] */
+
     /* Tokenizer */
     Tokenizer*  tokenizer;            /* BPE tokenizer */
 
