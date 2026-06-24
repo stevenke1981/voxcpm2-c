@@ -931,6 +931,64 @@ VoxCPMError conv1d_transpose_forward(const Conv1DTranspose* conv, const Tensor* 
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * GPU upload helpers
+ * ═══════════════════════════════════════════════════════════════ */
+
+VoxCPMError rms_norm_to_cuda(RmsNorm* norm) {
+    if (!norm) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    return tensor_to_cuda(norm->weight);
+#else
+    (void)norm;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}
+
+VoxCPMError attention_to_cuda(Attention* attn) {
+    if (!attn) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    VoxCPMError err;
+    err = tensor_to_cuda(attn->wq);  if (err) return err;
+    err = tensor_to_cuda(attn->wk);  if (err) return err;
+    err = tensor_to_cuda(attn->wv);  if (err) return err;
+    err = tensor_to_cuda(attn->wo);  if (err) return err;
+    return VOXCPM_SUCCESS;
+#else
+    (void)attn;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}
+
+VoxCPMError swiglu_to_cuda(SwiGLU* ff) {
+    if (!ff) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    VoxCPMError err;
+    err = tensor_to_cuda(ff->w1);  if (err) return err;
+    err = tensor_to_cuda(ff->w2);  if (err) return err;
+    err = tensor_to_cuda(ff->w3);  if (err) return err;
+    return VOXCPM_SUCCESS;
+#else
+    (void)ff;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}
+
+VoxCPMError transformer_block_to_cuda(TransformerBlock* block) {
+    if (!block) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    VoxCPMError err;
+    err = rms_norm_to_cuda(block->rms_attn);   if (err) return err;
+    err = attention_to_cuda(block->attn);       if (err) return err;
+    err = rms_norm_to_cuda(block->rms_ffn);     if (err) return err;
+    err = swiglu_to_cuda(block->ffn);           if (err) return err;
+    return VOXCPM_SUCCESS;
+#else
+    (void)block;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * Snake activation
  * ═══════════════════════════════════════════════════════════════ */
 

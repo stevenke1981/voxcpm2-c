@@ -126,7 +126,7 @@ VoxCPMGenConfig voxcpm_gen_config_default(void) {
     cfg.denoise = true;
     cfg.normalize = true;
     cfg.seed = 0;
-    cfg.max_new_tokens = 4;
+    cfg.max_new_tokens = 1024;
     cfg.temperature = 1.0f;
     cfg.timeout_ms = 0;
     return cfg;
@@ -490,6 +490,79 @@ void voxcpm_free(VoxCPMModel* model) {
     model->tokenizer = NULL;
     free(model);
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ * GPU upload — recursively upload all model weights to GPU
+ * ═══════════════════════════════════════════════════════════════ */
+#ifdef VOXCPM_CUDA
+VoxCPMError voxcpm_to_cuda(VoxCPMModel* model) {
+    if (!model) return VOXCPM_ERR_INTERNAL;
+
+    VoxCPMError err;
+
+    // Initialize CUDA runtime
+    err = tensor_cuda_init();
+    if (err) {
+        LOG_ERROR("GPU init failed: err=%d", err);
+        return err;
+    }
+
+    // Top-level tensor fields
+    err = tensor_to_cuda(model->lm_to_dit_weight);
+    if (err) LOG_WARN("lm_to_dit_weight upload failed: err=%d", err);
+    err = tensor_to_cuda(model->lm_to_dit_bias);
+    if (err) LOG_WARN("lm_to_dit_bias upload failed: err=%d", err);
+    err = tensor_to_cuda(model->enc_to_lm_proj_weight);
+    if (err) LOG_WARN("enc_to_lm_proj_weight upload failed: err=%d", err);
+    err = tensor_to_cuda(model->enc_to_lm_proj_bias);
+    if (err) LOG_WARN("enc_to_lm_proj_bias upload failed: err=%d", err);
+    err = tensor_to_cuda(model->res_to_dit_proj_weight);
+    if (err) LOG_WARN("res_to_dit_proj_weight upload failed: err=%d", err);
+    err = tensor_to_cuda(model->res_to_dit_proj_bias);
+    if (err) LOG_WARN("res_to_dit_proj_bias upload failed: err=%d", err);
+    err = tensor_to_cuda(model->fusion_concat_proj_weight);
+    if (err) LOG_WARN("fusion_concat_proj_weight upload failed: err=%d", err);
+    err = tensor_to_cuda(model->fusion_concat_proj_bias);
+    if (err) LOG_WARN("fusion_concat_proj_bias upload failed: err=%d", err);
+    err = tensor_to_cuda(model->freqs_cis);
+    if (err) LOG_WARN("freqs_cis upload failed: err=%d", err);
+    err = tensor_to_cuda(model->text_embed);
+    if (err) LOG_WARN("text_embed upload failed: err=%d", err);
+    err = tensor_to_cuda(model->audio_embed);
+    if (err) LOG_WARN("audio_embed upload failed: err=%d", err);
+
+    // Sub-module uploads
+    if (model->tslm) {
+        err = tslm_to_cuda(model->tslm);
+        if (err) LOG_WARN("tslm_to_cuda failed: err=%d", err);
+    }
+    if (model->ralm) {
+        err = ralm_to_cuda(model->ralm);
+        if (err) LOG_WARN("ralm_to_cuda failed: err=%d", err);
+    }
+    if (model->loc_enc) {
+        err = loc_enc_to_cuda(model->loc_enc);
+        if (err) LOG_WARN("loc_enc_to_cuda failed: err=%d", err);
+    }
+    if (model->loc_dit) {
+        err = loc_dit_to_cuda(model->loc_dit);
+        if (err) LOG_WARN("loc_dit_to_cuda failed: err=%d", err);
+    }
+    if (model->audio_vae) {
+        err = audio_vae_to_cuda(model->audio_vae);
+        if (err) LOG_WARN("audio_vae_to_cuda failed: err=%d", err);
+    }
+
+    LOG_INFO("GPU upload complete");
+    return VOXCPM_SUCCESS;
+}
+#else
+VoxCPMError voxcpm_to_cuda(VoxCPMModel* model) {
+    (void)model;
+    LOG_WARN("GPU upload not available (compiled without VOXCPM_CUDA)");
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+}
+#endif /* VOXCPM_CUDA */
 
 char* voxcpm_model_info(const VoxCPMModel* model) {
     if (!model) return NULL;

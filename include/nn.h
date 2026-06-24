@@ -32,6 +32,10 @@ RmsNorm* rms_norm_create(int d_model, float eps);
 void rms_norm_free(RmsNorm* norm);
 VoxCPMError rms_norm_forward(const RmsNorm* norm, const Tensor* x, Tensor* out);
 
+#ifdef VOXCPM_CUDA
+VoxCPMError rms_norm_to_cuda(RmsNorm* norm);
+#endif
+
 /* ═══════════════════════════════════════════════════════════════
  * Layer Norm (standalone)
  * ═══════════════════════════════════════════════════════════════ */
@@ -153,6 +157,10 @@ VoxCPMError transformer_block_forward(
     Tensor* out
 );
 
+#ifdef VOXCPM_CUDA
+VoxCPMError transformer_block_to_cuda(TransformerBlock* block);
+#endif
+
 /* ═══════════════════════════════════════════════════════════════
  * Diffusion Transformer Block (for LocDiT)
  *
@@ -229,6 +237,18 @@ void conv1d_transpose_free(Conv1DTranspose* conv);
 VoxCPMError conv1d_transpose_forward(
     const Conv1DTranspose* conv, const Tensor* x, Tensor* out
 );
+
+/* ═══════════════════════════════════════════════════════════════
+ * GPU upload helpers
+ *
+ * Recursively upload all tensor fields within a layer/module
+ * to GPU device memory.  Idempotent: safe to call multiple times.
+ * Returns VOXCPM_ERR_CUDA_NOT_FOUND when CUDA is not compiled in.
+ * ═══════════════════════════════════════════════════════════════ */
+VoxCPMError rms_norm_to_cuda(RmsNorm* norm);
+VoxCPMError attention_to_cuda(Attention* attn);
+VoxCPMError swiglu_to_cuda(SwiGLU* ff);
+VoxCPMError transformer_block_to_cuda(TransformerBlock* block);
 
 /* ═══════════════════════════════════════════════════════════════
  * Snake activation (for AudioVAE V2)

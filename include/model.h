@@ -531,6 +531,30 @@ VoxCPMError weight_load_tensor(
     Tensor** out_tensor
 );
 
+/* ═══════════════════════════════════════════════════════════════
+ * GPU upload helpers for top-level sub-models
+ *
+ * Recursively upload all tensor weights (and KV cache, if present)
+ * to GPU device memory.  Idempotent.
+ * Returns VOXCPM_ERR_CUDA_NOT_FOUND when CUDA is not compiled in.
+ * ═══════════════════════════════════════════════════════════════ */
+VoxCPMError tslm_to_cuda(TSLM* tslm);
+VoxCPMError ralm_to_cuda(RALM* ralm);
+VoxCPMError loc_enc_to_cuda(LocEnc* enc);
+VoxCPMError loc_dit_to_cuda(LocDiT* dit);
+
+/* AudioVAE GPU upload helpers */
+VoxCPMError wnconv_to_cuda(WNConv* conv);
+VoxCPMError audiovae_resblock_to_cuda(AudioVAEResBlock* block);
+VoxCPMError audiovae_encoder_block_to_cuda(AudioVAEEncoderBlock* block);
+VoxCPMError audiovae_decoder_block_to_cuda(AudioVAEDecoderBlock* block);
+VoxCPMError audiovae_encoder_to_cuda(AudioVAEEncoder* enc);
+VoxCPMError audiovae_decoder_to_cuda(AudioVAEDecoder* dec);
+VoxCPMError audio_vae_to_cuda(AudioVAE* vae);
+
+/* Top-level: upload all model weights to GPU */
+VoxCPMError voxcpm_to_cuda(VoxCPMModel* model);
+
 #ifdef __cplusplus
 }
 #endif

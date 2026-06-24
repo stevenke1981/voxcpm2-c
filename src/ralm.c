@@ -457,3 +457,42 @@ VoxCPMError ralm_forward_step(RALM* ralm, const Tensor* x,
 
     return err;
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ *  ralm_to_cuda — Upload RALM weights and KV cache to GPU.
+ *
+ *  Iterates through all tensor fields in the RALM structure and
+ *  calls tensor_to_cuda() on each.  Handles the layer array,
+ *  output norm, and KV cache tensors.
+ * ═══════════════════════════════════════════════════════════════ */
+VoxCPMError ralm_to_cuda(RALM* ralm) {
+    if (!ralm) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    VoxCPMError err;
+
+    /* Transformer layers */
+    for (int i = 0; i < ralm->n_layers; i++) {
+        err = transformer_block_to_cuda(&ralm->layers[i]);
+        if (err) return err;
+    }
+
+    /* Output RMS norm */
+    err = rms_norm_to_cuda(ralm->output_norm);
+    if (err) return err;
+
+    /* KV cache (may be NULL if not yet allocated) */
+    if (ralm->cache_k) {
+        err = tensor_to_cuda(ralm->cache_k);
+        if (err) return err;
+    }
+    if (ralm->cache_v) {
+        err = tensor_to_cuda(ralm->cache_v);
+        if (err) return err;
+    }
+
+    return VOXCPM_SUCCESS;
+#else
+    (void)ralm;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}

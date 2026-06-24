@@ -399,3 +399,46 @@ VoxCPMError tslm_forward_step(TSLM* tslm, const Tensor* x,
 
     return err;
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ *  tslm_to_cuda — Upload TSLM weights and KV cache to GPU.
+ *
+ *  Iterates through all tensor fields in the TSLM structure and
+ *  calls tensor_to_cuda() on each.  Handles the layer array,
+ *  embedding weight, output norm, and KV cache tensors.
+ * ═══════════════════════════════════════════════════════════════ */
+VoxCPMError tslm_to_cuda(TSLM* tslm) {
+    if (!tslm) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    VoxCPMError err;
+
+    /* Token embedding */
+    err = tensor_to_cuda(tslm->embed_weight);
+    if (err) return err;
+
+    /* Transformer layers */
+    for (int i = 0; i < tslm->n_layers; i++) {
+        err = transformer_block_to_cuda(&tslm->layers[i]);
+        if (err) return err;
+    }
+
+    /* Output RMS norm */
+    err = rms_norm_to_cuda(tslm->output_norm);
+    if (err) return err;
+
+    /* KV cache (may be NULL if not yet allocated) */
+    if (tslm->cache_k) {
+        err = tensor_to_cuda(tslm->cache_k);
+        if (err) return err;
+    }
+    if (tslm->cache_v) {
+        err = tensor_to_cuda(tslm->cache_v);
+        if (err) return err;
+    }
+
+    return VOXCPM_SUCCESS;
+#else
+    (void)tslm;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}

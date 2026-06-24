@@ -587,3 +587,71 @@ cleanup_sample:
     tensor_free(x_next);
     return err;
 }
+
+/* ═════════════════════════════════════════════════════════════════
+ * loc_dit_to_cuda — Upload LocDiT weights and sub-modules to GPU
+ * ═════════════════════════════════════════════════════════════════ */
+#ifdef VOXCPM_CUDA
+VoxCPMError loc_dit_to_cuda(LocDiT* dit) {
+    if (!dit) return VOXCPM_ERR_INTERNAL;
+
+    VoxCPMError err;
+
+    err = tensor_to_cuda(dit->in_proj_weight);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->in_proj_bias);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->cond_proj_weight);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->cond_proj_bias);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->out_proj_weight);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->out_proj_bias);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->time_mlp_1_weight);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->time_mlp_1_bias);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->time_mlp_2_weight);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->time_mlp_2_bias);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->delta_mlp_1_weight);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->delta_mlp_1_bias);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->delta_mlp_2_weight);
+    if (err) return err;
+
+    err = tensor_to_cuda(dit->delta_mlp_2_bias);
+    if (err) return err;
+
+    for (int i = 0; i < dit->n_layers; i++) {
+        err = transformer_block_to_cuda(&dit->layers[i]);
+        if (err) return err;
+    }
+
+    err = rms_norm_to_cuda(dit->output_norm);
+    if (err) return err;
+
+    return VOXCPM_SUCCESS;
+}
+#else
+VoxCPMError loc_dit_to_cuda(LocDiT* dit) {
+    (void)dit;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+}
+#endif /* VOXCPM_CUDA */

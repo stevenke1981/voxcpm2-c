@@ -178,3 +178,38 @@ cleanup:
     tensor_free(cache_v);
     return err;
 }
+
+/* ═════════════════════════════════════════════════════════════════
+ * loc_enc_to_cuda — Upload LocEnc weights and sub-modules to GPU
+ * ═════════════════════════════════════════════════════════════════ */
+#ifdef VOXCPM_CUDA
+VoxCPMError loc_enc_to_cuda(LocEnc* enc) {
+    if (!enc) return VOXCPM_ERR_INTERNAL;
+
+    VoxCPMError err;
+
+    err = tensor_to_cuda(enc->in_proj_weight);
+    if (err) return err;
+
+    err = tensor_to_cuda(enc->in_proj_bias);
+    if (err) return err;
+
+    err = tensor_to_cuda(enc->special_token);
+    if (err) return err;
+
+    for (int i = 0; i < enc->n_layers; i++) {
+        err = transformer_block_to_cuda(&enc->layers[i]);
+        if (err) return err;
+    }
+
+    err = rms_norm_to_cuda(enc->output_norm);
+    if (err) return err;
+
+    return VOXCPM_SUCCESS;
+}
+#else
+VoxCPMError loc_enc_to_cuda(LocEnc* enc) {
+    (void)enc;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+}
+#endif /* VOXCPM_CUDA */

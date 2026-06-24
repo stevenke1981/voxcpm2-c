@@ -1224,3 +1224,184 @@ cleanup:
     tensor_free(h);
     return err;
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ * GPU upload helpers
+ * ═══════════════════════════════════════════════════════════════ */
+
+VoxCPMError wnconv_to_cuda(WNConv* conv) {
+    if (!conv) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    VoxCPMError err;
+
+    err = tensor_to_cuda(conv->weight_v);
+    if (err) return err;
+
+    err = tensor_to_cuda(conv->weight_g);
+    if (err) return err;
+
+    if (conv->bias) {
+        err = tensor_to_cuda(conv->bias);
+        if (err) return err;
+    }
+
+    if (conv->effective_weight) {
+        err = tensor_to_cuda(conv->effective_weight);
+        if (err) return err;
+    }
+
+    return VOXCPM_SUCCESS;
+#else
+    (void)conv;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}
+
+VoxCPMError audiovae_resblock_to_cuda(AudioVAEResBlock* block) {
+    if (!block) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    VoxCPMError err;
+
+    err = wnconv_to_cuda(block->conv_depthwise);
+    if (err) return err;
+
+    err = wnconv_to_cuda(block->conv_pointwise);
+    if (err) return err;
+
+    err = tensor_to_cuda(block->snake_alpha1);
+    if (err) return err;
+
+    err = tensor_to_cuda(block->snake_alpha2);
+    if (err) return err;
+
+    return VOXCPM_SUCCESS;
+#else
+    (void)block;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}
+
+VoxCPMError audiovae_encoder_block_to_cuda(AudioVAEEncoderBlock* block) {
+    if (!block) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    VoxCPMError err;
+
+    err = tensor_to_cuda(block->stride_alpha);
+    if (err) return err;
+
+    err = wnconv_to_cuda(block->stride_conv);
+    if (err) return err;
+
+    for (int j = 0; j < block->num_res_blocks; j++) {
+        err = audiovae_resblock_to_cuda(&block->res_blocks[j]);
+        if (err) return err;
+    }
+
+    return VOXCPM_SUCCESS;
+#else
+    (void)block;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}
+
+VoxCPMError audiovae_decoder_block_to_cuda(AudioVAEDecoderBlock* block) {
+    if (!block) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    VoxCPMError err;
+
+    err = tensor_to_cuda(block->snake_alpha);
+    if (err) return err;
+
+    err = wnconv_to_cuda(block->convtr);
+    if (err) return err;
+
+    for (int j = 0; j < block->num_res_blocks; j++) {
+        err = audiovae_resblock_to_cuda(&block->res_blocks[j]);
+        if (err) return err;
+    }
+
+    return VOXCPM_SUCCESS;
+#else
+    (void)block;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}
+
+VoxCPMError audiovae_encoder_to_cuda(AudioVAEEncoder* enc) {
+    if (!enc) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    VoxCPMError err;
+
+    err = wnconv_to_cuda(enc->conv_in);
+    if (err) return err;
+
+    for (int i = 0; i < 4; i++) {
+        err = audiovae_encoder_block_to_cuda(&enc->blocks[i]);
+        if (err) return err;
+    }
+
+    err = wnconv_to_cuda(enc->fc_mu);
+    if (err) return err;
+
+    err = wnconv_to_cuda(enc->fc_logvar);
+    if (err) return err;
+
+    return VOXCPM_SUCCESS;
+#else
+    (void)enc;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}
+
+VoxCPMError audiovae_decoder_to_cuda(AudioVAEDecoder* dec) {
+    if (!dec) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    VoxCPMError err;
+
+    err = wnconv_to_cuda(dec->conv_in);
+    if (err) return err;
+
+    err = wnconv_to_cuda(dec->proj_up);
+    if (err) return err;
+
+    for (int i = 0; i < AUDIOVAE_NUM_DECODER_BLOCKS; i++) {
+        err = audiovae_decoder_block_to_cuda(&dec->decoder_blocks[i]);
+        if (err) return err;
+    }
+
+    if (dec->final_snake_alpha) {
+        err = tensor_to_cuda(dec->final_snake_alpha);
+        if (err) return err;
+    }
+
+    err = wnconv_to_cuda(dec->conv_out);
+    if (err) return err;
+
+    return VOXCPM_SUCCESS;
+#else
+    (void)dec;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}
+
+VoxCPMError audio_vae_to_cuda(AudioVAE* vae) {
+    if (!vae) return VOXCPM_ERR_INTERNAL;
+#ifdef VOXCPM_CUDA
+    VoxCPMError err;
+
+    if (vae->encoder) {
+        err = audiovae_encoder_to_cuda(vae->encoder);
+        if (err) return err;
+    }
+
+    if (vae->decoder) {
+        err = audiovae_decoder_to_cuda(vae->decoder);
+        if (err) return err;
+    }
+
+    return VOXCPM_SUCCESS;
+#else
+    (void)vae;
+    return VOXCPM_ERR_CUDA_NOT_FOUND;
+#endif
+}
