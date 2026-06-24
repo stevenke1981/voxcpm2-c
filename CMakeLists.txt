@@ -85,10 +85,9 @@ if(VOXCPM_CUDA)
     # VS 18.0 is newer than CUDA 12.6's supported compiler list
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
 
-    # Find CUDA toolkit (for headers/libraries, not compilation)
-    find_package(CUDA REQUIRED)
-    include_directories(${CUDA_INCLUDE_DIRS})
-    list(APPEND VOXCPM_LIBS ${CUDA_LIBRARIES})
+    # Find CUDA toolkit with modern CUDAToolkit module (provides CUDA::cublas etc.)
+    find_package(CUDAToolkit REQUIRED)
+    list(APPEND VOXCPM_LIBS CUDA::cublas CUDA::cudart)
 endif()
 
 # ─── Sources ───
