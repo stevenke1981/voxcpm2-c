@@ -161,6 +161,13 @@ void voxcpm_free(VoxCPMModel* model);
  */
 char* voxcpm_model_info(const VoxCPMModel* model);
 
+/*
+ * 上傳模型權重到 GPU（需 VOXCPM_CUDA 編譯）。
+ * 回傳 VOXCPM_ERR_CUDA_NOT_FOUND 若 GPU 不可用。
+ * 成功後 voxcpm_generate 會使用 GPU 進行所有運算。
+ */
+VoxCPMError voxcpm_to_cuda(VoxCPMModel* model);
+
 /* ═══════════════════════════════════════════════════════════════
  * Text-to-Speech Generation
  * ═══════════════════════════════════════════════════════════════ */

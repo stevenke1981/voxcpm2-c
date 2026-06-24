@@ -935,13 +935,12 @@ VoxCPMError conv1d_transpose_forward(const Conv1DTranspose* conv, const Tensor* 
  * ═══════════════════════════════════════════════════════════════ */
 
 VoxCPMError rms_norm_to_cuda(RmsNorm* norm) {
-    if (!norm) return VOXCPM_ERR_INTERNAL;
-#ifdef VOXCPM_CUDA
-    return tensor_to_cuda(norm->weight);
-#else
     (void)norm;
-    return VOXCPM_ERR_CUDA_NOT_FOUND;
-#endif
+    /* RMS norm weight is always accessed directly by CPU code (tensor_rms_norm).
+     * It is tiny (d_model floats) and only used for element-wise multiply.
+     * Uploading to GPU would cause access violations on CPU reads.
+     * Keep it on CPU. */
+    return VOXCPM_SUCCESS;
 }
 
 VoxCPMError attention_to_cuda(Attention* attn) {

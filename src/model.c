@@ -526,15 +526,23 @@ VoxCPMError voxcpm_to_cuda(VoxCPMModel* model) {
     if (err) LOG_WARN("fusion_concat_proj_bias upload failed: err=%d", err);
     err = tensor_to_cuda(model->freqs_cis);
     if (err) LOG_WARN("freqs_cis upload failed: err=%d", err);
-    err = tensor_to_cuda(model->text_embed);
-    if (err) LOG_WARN("text_embed upload failed: err=%d", err);
-    err = tensor_to_cuda(model->audio_embed);
-    if (err) LOG_WARN("audio_embed upload failed: err=%d", err);
+    if (model->text_embed) {
+        err = tensor_to_cuda(model->text_embed);
+        if (err) LOG_WARN("text_embed upload failed: err=%d", err);
+    }
+    if (model->audio_embed) {
+        err = tensor_to_cuda(model->audio_embed);
+        if (err) LOG_WARN("audio_embed upload failed: err=%d", err);
+    }
 
     // Sub-module uploads
     if (model->tslm) {
         err = tslm_to_cuda(model->tslm);
         if (err) LOG_WARN("tslm_to_cuda failed: err=%d", err);
+        // Embedding weights must stay on CPU: CPU code reads them directly
+        // (voxcpm_generate embedding lookup). Download back after GPU upload.
+        err = tensor_to_cpu(model->tslm->embed_weight);
+        if (err) LOG_WARN("tslm embed_weight download back failed: err=%d", err);
     }
     if (model->ralm) {
         err = ralm_to_cuda(model->ralm);
@@ -548,10 +556,9 @@ VoxCPMError voxcpm_to_cuda(VoxCPMModel* model) {
         err = loc_dit_to_cuda(model->loc_dit);
         if (err) LOG_WARN("loc_dit_to_cuda failed: err=%d", err);
     }
-    if (model->audio_vae) {
-        err = audio_vae_to_cuda(model->audio_vae);
-        if (err) LOG_WARN("audio_vae_to_cuda failed: err=%d", err);
-    }
+    // AudioVAE uses custom convolution (not tensor_matmul_nt) that reads
+    // weight->data directly on CPU. Keep all AudioVAE weights on CPU.
+    // AudioVAE encode/decode are a small portion of total inference compute.
 
     LOG_INFO("GPU upload complete");
     return VOXCPM_SUCCESS;

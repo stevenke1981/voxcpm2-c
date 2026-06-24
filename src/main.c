@@ -252,6 +252,17 @@ static int cmd_tts(const CLIOptions* opts) {
         free(info);
     }
 
+    // Upload to GPU if requested
+    if (opts->use_gpu) {
+        printf("Uploading to GPU...\n");
+        err = voxcpm_to_cuda(model);
+        if (err != VOXCPM_SUCCESS) {
+            fprintf(stderr, "GPU upload failed: %s — falling back to CPU\n", voxcpm_error_string(err));
+        } else {
+            printf("GPU upload complete\n");
+        }
+    }
+
     // Create generation config
     VoxCPMGenConfig gen_cfg = voxcpm_gen_config_default();
     gen_cfg.text = opts->text;
