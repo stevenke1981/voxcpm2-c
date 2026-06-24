@@ -51,6 +51,7 @@ typedef struct {
     char        voice_design[MAX_TEXT];
     float       cfg_value;
     int         steps;
+    int         max_new_tokens;
     int         threads;
     int         seed;
     bool        use_gpu;
@@ -69,6 +70,7 @@ static CLIOptions default_options(void) {
     opts.cmd = CMD_TTS;
     opts.cfg_value = 2.0f;
     opts.steps = 10;
+    opts.max_new_tokens = 4;
     opts.threads = 4;
     opts.seed = 0;
     opts.use_gpu = false;
@@ -103,6 +105,7 @@ static void print_usage(const char* prog) {
     printf("  -d, --description TEXT Voice description (design mode)\n");
     printf("  --cfg FLOAT            CFG value (default: 2.0)\n");
     printf("  --steps INT            Diffusion steps (default: 10)\n");
+    printf("  --max-new-tokens INT   Maximum generated latent tokens (default: 4)\n");
     printf("  --cpu                  Force CPU mode\n");
     printf("  --gpu                  Force GPU mode\n");
     printf("  --threads INT          CPU threads (default: 4)\n");
@@ -161,6 +164,9 @@ static int parse_args(int argc, char** argv, CLIOptions* opts) {
         } else if (strcmp(argv[i], "--steps") == 0) {
             if (++i >= argc) return -1;
             opts->steps = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--max-new-tokens") == 0 || strcmp(argv[i], "--max_new_tokens") == 0) {
+            if (++i >= argc) return -1;
+            opts->max_new_tokens = atoi(argv[i]);
         } else if (strcmp(argv[i], "--cpu") == 0) {
             opts->use_gpu = false;
         } else if (strcmp(argv[i], "--gpu") == 0) {
@@ -251,6 +257,7 @@ static int cmd_tts(const CLIOptions* opts) {
     gen_cfg.text = opts->text;
     gen_cfg.cfg_value = opts->cfg_value;
     gen_cfg.inference_timesteps = opts->steps;
+    gen_cfg.max_new_tokens = opts->max_new_tokens;
     gen_cfg.seed = opts->seed;
 
     // Generate speech

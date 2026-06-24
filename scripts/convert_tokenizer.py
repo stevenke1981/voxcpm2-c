@@ -60,8 +60,9 @@ def convert_tokenizer(json_path: str, bin_path: str):
     # Extract merge rules
     merges = model.get("merges", [])
     # merges is a list of strings like "token1 token2"
-    # Each pair maps to a new token
+    # Each pair maps to a new token: the merged token string = left_str + right_str
     merge_pairs = []
+    skipped_count = 0
     for i, merge_str in enumerate(merges):
         parts = merge_str.strip().split()
         if len(parts) >= 2:
@@ -70,21 +71,24 @@ def convert_tokenizer(json_path: str, bin_path: str):
             if left_str in vocab_dict and right_str in vocab_dict:
                 left_id = vocab_dict[left_str]
                 right_id = vocab_dict[right_str]
-                new_id = vocab_size + i  # Typically new tokens are added at end
-                # Actually, in BPE, the merge result is a new token that gets
-                # its own ID. For sentencepiece/BPE tokenizers from HF, the
-                # merge index maps to the merge rule's resulting token.
-                # The rank is typically just the index in the list.
+                # The merged result token is the concatenation of left and right.
+                # Look up its actual token ID in the vocabulary.
+                merged_str = left_str + right_str
+                if merged_str in vocab_dict:
+                    new_id = vocab_dict[merged_str]
+                else:
+                    # Fallback: should not happen for well-formed tokenizers
+                    new_id = vocab_size + i
+                    skipped_count += 1
                 merge_pairs.append((left_id, right_id, new_id, i))
             else:
-                # Try the token bytes directly
-                left_bytes = left_str.encode("utf-8")
-                right_bytes = right_str.encode("utf-8")
-                # Check if the composed token "left+right" is in the vocab
-                # This is a simplification
+                skipped_count += 1
                 print(f"  Warning: merge[{i}] token not in vocab: '{left_str}' '{right_str}'")
         else:
+            skipped_count += 1
             print(f"  Warning: merge[{i}] unparseable: '{merge_str}'")
+
+    print(f"  Merges: {len(merge_pairs)} (skipped={skipped_count})")
 
     print(f"  Merges: {len(merge_pairs)}")
 

@@ -26,7 +26,8 @@ option(VOXCPM_STATIC_DEPS   "Statically link dependencies"       OFF)
 
 # ─── Compile Warnings ───
 if(MSVC)
-    add_compile_options(/W4 /utf-8)
+    # Use CMAKE_C_FLAGS to avoid nvcc seeing MSVC-specific flags
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /W4 /utf-8")
     add_definitions(-D_CRT_SECURE_NO_WARNINGS)
 else()
     add_compile_options(
@@ -40,10 +41,20 @@ endif()
 
 # ─── Debug/Release Flags ───
 if(CMAKE_BUILD_TYPE MATCHES "Debug|RelWithDebInfo")
-    add_compile_options(-g -O0)
+    if(MSVC)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /Od")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=\"/Od\"")
+    else()
+        add_compile_options(-g -O0)
+    endif()
     add_definitions(-DVOXCPM_DEBUG)
 else()
-    add_compile_options(-O3 -DNDEBUG)
+    if(MSVC)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /O2 /GL")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=\"/O2\"")
+    else()
+        add_compile_options(-O3 -DNDEBUG)
+    endif()
     if(VOXCPM_NATIVE AND NOT MSVC)
         add_compile_options(-march=native -mtune=native)
     endif()
@@ -71,7 +82,10 @@ if(VOXCPM_CUDA)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     add_definitions(-DVOXCPM_CUDA)
     
-    # Find CUDA toolkit
+    # VS 18.0 is newer than CUDA 12.6's supported compiler list
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
+
+    # Find CUDA toolkit (for headers/libraries, not compilation)
     find_package(CUDA REQUIRED)
     include_directories(${CUDA_INCLUDE_DIRS})
     list(APPEND VOXCPM_LIBS ${CUDA_LIBRARIES})

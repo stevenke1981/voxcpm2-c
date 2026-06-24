@@ -61,6 +61,18 @@ static Tensor* audio_vae_load_weight(const char* name, const uint8_t* mmap_data,
     return t;
 }
 
+static Tensor* audio_vae_load_weight_fp32(const char* name, const uint8_t* mmap_data, const WeightIndex* idx) {
+    Tensor* t = audio_vae_load_weight(name, mmap_data, idx);
+    if (!t) return NULL;
+    VoxCPMError err = tensor_ensure_fp32(t);
+    if (err != VOXCPM_SUCCESS) {
+        LOG_ERROR("Failed to convert weight to fp32: %s", name);
+        tensor_free(t);
+        return NULL;
+    }
+    return t;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * WNConv Helper: compute effective_weight from weight_v and weight_g
  *
@@ -85,6 +97,13 @@ static VoxCPMError wnconv_compute_effective_weight(WNConv* wn) {
 
     Tensor* wv = wn->weight_v;
     Tensor* wg = wn->weight_g;
+
+    /* Ensure weights are FP32 for direct float* access */
+    VoxCPMError conv_err;
+    conv_err = tensor_ensure_fp32(wv);
+    if (conv_err) return conv_err;
+    conv_err = tensor_ensure_fp32(wg);
+    if (conv_err) return conv_err;
 
     int out_channels, in_channels, kernel_size;
 
@@ -296,6 +315,17 @@ static VoxCPMError snake_forward(Tensor* x, const Tensor* alpha) {
     int batch = x->shape[0];
     float beta = AUDIOVAE_SNAKE_BETA;
 
+    if (alpha->size < (size_t)channels) {
+        LOG_ERROR("snake_forward: alpha size=%zu < channels=%d (x=[%d,%d,%d], alpha_ndim=%d shape=[%d,%d,%d])",
+                  alpha->size, channels,
+                  x->shape[0], x->shape[1], x->shape[2],
+                  alpha->ndim,
+                  alpha->ndim > 0 ? alpha->shape[0] : 0,
+                  alpha->ndim > 1 ? alpha->shape[1] : 0,
+                  alpha->ndim > 2 ? alpha->shape[2] : 0);
+        return VOXCPM_ERR_SHAPE_MISMATCH;
+    }
+
     for (int b = 0; b < batch; b++) {
         for (int c = 0; c < channels; c++) {
             float a = alpha->data[c];  /* alpha is [1, C, 1] */
@@ -400,6 +430,14 @@ static VoxCPMError decoder_block_forward(
     int batch = x->shape[0];
     int T_in  = x->shape[2];
 
+    LOG_DEBUG("decoder_block_forward: input=[%d,%d,%d] convtr=%d->%d k=%d stride=%d pad=%d",
+              x->shape[0], x->shape[1], x->shape[2],
+              block->convtr ? block->convtr->in_channels : -1,
+              block->convtr ? block->convtr->out_channels : -1,
+              block->convtr ? block->convtr->kernel_size : -1,
+              block->convtr ? block->convtr->stride : -1,
+              block->convtr ? block->convtr->padding : -1);
+
     /* Step 1: Snake activation (in-place) */
     if (block->snake_alpha) {
         err = snake_forward(x, block->snake_alpha);
@@ -422,11 +460,79 @@ static VoxCPMError decoder_block_forward(
     if (err) { tensor_free(conv_out); return err; }
     x = conv_out;
 
+    LOG_DEBUG("decoder_block_forward: after convtr=[%d,%d,%d]",
+              x->shape[0], x->shape[1], x->shape[2]);
+
     /* Step 3: Residual sub-blocks */
+    for (int j = 0; j < block->num_res_blocks; j++) {
+        LOG_DEBUG("decoder_block_forward: res block %d input=[%d,%d,%d]",
+                  j, x->shape[0], x->shape[1], x->shape[2]);
+        err = residual_sub_block_forward(&block->res_blocks[j], &x);
+        if (err) return err;
+    }
+
+    *px = x;
+    return VOXCPM_SUCCESS;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * EncoderBlock forward
+ *
+ *   Input [B, C_in, T_in]
+ *     1. 3× ResidualSubBlock (Snake→Depthwise→Snake→Pointwise + skip)
+ *     2. Snake(x, stride_alpha) — in-place
+ *     3. Strided Conv1D [B, C_in, T_in] -> [B, C_out, T_out]
+ * ═══════════════════════════════════════════════════════════════ */
+static VoxCPMError encoder_block_forward(
+    const AudioVAEEncoderBlock* block,
+    Tensor** px)
+{
+    VoxCPMError err;
+    Tensor* x = *px;
+    int batch   = x->shape[0];
+    int C_in    = x->shape[1];
+    int T_in    = x->shape[2];
+
+    LOG_DEBUG("encoder_block_forward: input=[%d,%d,%d] stride_conv=%d->%d k=%d s=%d p=%d",
+              batch, C_in, T_in,
+              block->stride_conv ? block->stride_conv->in_channels : -1,
+              block->stride_conv ? block->stride_conv->out_channels : -1,
+              block->stride_conv ? block->stride_conv->kernel_size : -1,
+              block->stride_conv ? block->stride_conv->stride : -1,
+              block->stride_conv ? block->stride_conv->padding : -1);
+
+    /* Step 1: 3× residual sub-blocks (same as decoder) */
     for (int j = 0; j < block->num_res_blocks; j++) {
         err = residual_sub_block_forward(&block->res_blocks[j], &x);
         if (err) return err;
     }
+
+    /* Step 2: Snake activation (in-place) */
+    if (block->stride_alpha) {
+        err = snake_forward(x, block->stride_alpha);
+        if (err) return err;
+    }
+
+    /* Step 3: Strided Conv1D (downsample) */
+    {
+        int T_out = (T_in + 2 * block->stride_conv->padding
+                     - block->stride_conv->kernel_size)
+                    / block->stride_conv->stride + 1;
+        int out_ch = block->stride_conv->out_channels;
+
+        if (T_out <= 0) return VOXCPM_ERR_SHAPE_MISMATCH;
+
+        Tensor* conv_out = tensor_create(3, (int[]){batch, out_ch, T_out});
+        if (!conv_out) return VOXCPM_ERR_OOM;
+
+        err = wnconv_forward(block->stride_conv, x, conv_out);
+        tensor_free(x);
+        if (err) { tensor_free(conv_out); return err; }
+        x = conv_out;
+    }
+
+    LOG_DEBUG("encoder_block_forward: output=[%d,%d,%d]",
+              x->shape[0], x->shape[1], x->shape[2]);
 
     *px = x;
     return VOXCPM_SUCCESS;
@@ -450,6 +556,18 @@ static void audio_vae_decoder_block_free(AudioVAEDecoderBlock* block) {
     if (!block) return;
     wnconv_free(block->convtr);
     tensor_free(block->snake_alpha);
+    for (int j = 0; j < block->num_res_blocks; j++) {
+        audio_vae_res_block_free(&block->res_blocks[j]);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * AudioVAEEncoderBlock: Free
+ * ═══════════════════════════════════════════════════════════════ */
+static void audio_vae_encoder_block_free(AudioVAEEncoderBlock* block) {
+    if (!block) return;
+    wnconv_free(block->stride_conv);
+    tensor_free(block->stride_alpha);
     for (int j = 0; j < block->num_res_blocks; j++) {
         audio_vae_res_block_free(&block->res_blocks[j]);
     }
@@ -524,7 +642,7 @@ AudioVAE* audio_vae_create(const VoxCPMConfig* config, const uint8_t* mmap_data,
         /* Load snake_alpha (block.0.alpha) */
         snprintf(key, sizeof(key),
                  "audio_vae.decoder.decoder_blocks.%d.snake_alpha", i);
-        blk->snake_alpha = audio_vae_load_weight(key, mmap_data, idx);
+        blk->snake_alpha = audio_vae_load_weight_fp32(key, mmap_data, idx);
         if (!blk->snake_alpha) {
             LOG_ERROR("audio_vae_create: missing snake_alpha for block %d", i);
             audio_vae_free(vae);
@@ -550,7 +668,7 @@ AudioVAE* audio_vae_create(const VoxCPMConfig* config, const uint8_t* mmap_data,
             /* snake_alpha1 (block.{j+2}.block.0.alpha) */
             snprintf(key, sizeof(key),
                      "audio_vae.decoder.decoder_blocks.%d.res_blocks.%d.snake_alpha1", i, j);
-            rb->snake_alpha1 = audio_vae_load_weight(key, mmap_data, idx);
+            rb->snake_alpha1 = audio_vae_load_weight_fp32(key, mmap_data, idx);
             if (!rb->snake_alpha1) {
                 LOG_ERROR("audio_vae_create: missing snake_alpha1 for block %d res %d", i, j);
                 audio_vae_free(vae);
@@ -574,7 +692,7 @@ AudioVAE* audio_vae_create(const VoxCPMConfig* config, const uint8_t* mmap_data,
             /* snake_alpha2 (block.{j+2}.block.2.alpha) */
             snprintf(key, sizeof(key),
                      "audio_vae.decoder.decoder_blocks.%d.res_blocks.%d.snake_alpha2", i, j);
-            rb->snake_alpha2 = audio_vae_load_weight(key, mmap_data, idx);
+            rb->snake_alpha2 = audio_vae_load_weight_fp32(key, mmap_data, idx);
             if (!rb->snake_alpha2) {
                 LOG_ERROR("audio_vae_create: missing snake_alpha2 for block %d res %d", i, j);
                 audio_vae_free(vae);
@@ -596,7 +714,7 @@ AudioVAE* audio_vae_create(const VoxCPMConfig* config, const uint8_t* mmap_data,
     }
 
     /* ── Load final_snake_alpha (model.8) ── */
-    dec->final_snake_alpha = audio_vae_load_weight(
+    dec->final_snake_alpha = audio_vae_load_weight_fp32(
         "audio_vae.decoder.final_snake_alpha", mmap_data, idx);
     if (!dec->final_snake_alpha) {
         LOG_ERROR("audio_vae_create: missing final_snake_alpha");
@@ -623,12 +741,141 @@ AudioVAE* audio_vae_create(const VoxCPMConfig* config, const uint8_t* mmap_data,
     dec->has_sr_cond = false;
     dec->sr_cond_layers = 0;
 
+    /* ═══════════════════════════════════════════════════════════
+     * Encoder weight loading
+     * ═══════════════════════════════════════════════════════════ */
+
+    /* conv_in: audio_vae.encoder.block.0 — (1→128, k=7, stride=1, pad=3) */
+    vae->encoder->conv_in = wnconv_create_and_load(
+        "audio_vae.encoder.block.0", false, mmap_data, idx);
+    if (!vae->encoder->conv_in) {
+        LOG_ERROR("audio_vae_create: failed to load encoder conv_in");
+        audio_vae_free(vae);
+        return NULL;
+    }
+    vae->encoder->conv_in->stride  = 1;
+    vae->encoder->conv_in->padding = 3;  /* SAME: k=7 */
+
+    /* Encoder blocks 0-3: audio_vae.encoder.block.{1-4} */
+    /* rates=[2,5,8,8], channels expand 128→256→512→1024→2048 */
+    int enc_rates[4] = {2, 5, 8, 8};
+    int enc_channels[5] = {128, 256, 512, 1024, 2048};
+
+    for (int i = 0; i < 4; i++) {
+        AudioVAEEncoderBlock* blk = &vae->encoder->blocks[i];
+        blk->num_res_blocks = AUDIOVAE_RES_BLOCKS_PER_BLOCK;  /* 3 */
+
+        char key[256];
+        int C_in = enc_channels[i];
+
+        /* Load 3 residual sub-blocks */
+        for (int j = 0; j < AUDIOVAE_RES_BLOCKS_PER_BLOCK; j++) {
+            AudioVAEResBlock* rb = &blk->res_blocks[j];
+
+            /* snake_alpha1: block.{i+1}.block.{j}.block.0.alpha */
+            snprintf(key, sizeof(key),
+                "audio_vae.encoder.block.%d.block.%d.block.0.alpha", i+1, j);
+            rb->snake_alpha1 = audio_vae_load_weight_fp32(key, mmap_data, idx);
+            if (!rb->snake_alpha1) {
+                LOG_ERROR("audio_vae_create: missing enc snake_alpha1 block %d sub %d", i, j);
+                audio_vae_free(vae);
+                return NULL;
+            }
+
+            /* conv_depthwise: block.{i+1}.block.{j}.block.1 */
+            snprintf(key, sizeof(key),
+                "audio_vae.encoder.block.%d.block.%d.block.1", i+1, j);
+            rb->conv_depthwise = wnconv_create_and_load(key, false, mmap_data, idx);
+            if (!rb->conv_depthwise) {
+                LOG_ERROR("audio_vae_create: missing enc depthwise block %d sub %d", i, j);
+                audio_vae_free(vae);
+                return NULL;
+            }
+            rb->conv_depthwise->stride  = 1;
+            rb->conv_depthwise->padding = 3;  /* SAME for k=7 */
+            rb->conv_depthwise->groups      = C_in;
+            rb->conv_depthwise->in_channels = C_in;
+
+            /* snake_alpha2: block.{i+1}.block.{j}.block.2.alpha */
+            snprintf(key, sizeof(key),
+                "audio_vae.encoder.block.%d.block.%d.block.2.alpha", i+1, j);
+            rb->snake_alpha2 = audio_vae_load_weight_fp32(key, mmap_data, idx);
+            if (!rb->snake_alpha2) {
+                LOG_ERROR("audio_vae_create: missing enc snake_alpha2 block %d sub %d", i, j);
+                audio_vae_free(vae);
+                return NULL;
+            }
+
+            /* conv_pointwise: block.{i+1}.block.{j}.block.3 */
+            snprintf(key, sizeof(key),
+                "audio_vae.encoder.block.%d.block.%d.block.3", i+1, j);
+            rb->conv_pointwise = wnconv_create_and_load(key, false, mmap_data, idx);
+            if (!rb->conv_pointwise) {
+                LOG_ERROR("audio_vae_create: missing enc pointwise block %d sub %d", i, j);
+                audio_vae_free(vae);
+                return NULL;
+            }
+            rb->conv_pointwise->stride  = 1;
+            rb->conv_pointwise->padding = 0;
+        }
+
+        /* stride_alpha: block.{i+1}.block.3.alpha */
+        snprintf(key, sizeof(key),
+            "audio_vae.encoder.block.%d.block.3.alpha", i+1);
+        blk->stride_alpha = audio_vae_load_weight_fp32(key, mmap_data, idx);
+        if (!blk->stride_alpha) {
+            LOG_ERROR("audio_vae_create: missing stride_alpha for block %d", i);
+            audio_vae_free(vae);
+            return NULL;
+        }
+
+        /* stride_conv: block.{i+1}.block.4 */
+        snprintf(key, sizeof(key),
+            "audio_vae.encoder.block.%d.block.4", i+1);
+        blk->stride_conv = wnconv_create_and_load(key, false, mmap_data, idx);
+        if (!blk->stride_conv) {
+            LOG_ERROR("audio_vae_create: missing stride_conv for block %d", i);
+            audio_vae_free(vae);
+            return NULL;
+        }
+        int kernel = 2 * enc_rates[i];
+        blk->stride_conv->stride  = enc_rates[i];
+        blk->stride_conv->padding = kernel / 2;  /* SAME: p = k // 2 */
+    }
+
+    /* fc_mu: audio_vae.encoder.fc_mu */
+    vae->encoder->fc_mu = wnconv_create_and_load(
+        "audio_vae.encoder.fc_mu", false, mmap_data, idx);
+    if (!vae->encoder->fc_mu) {
+        LOG_ERROR("audio_vae_create: missing fc_mu");
+        audio_vae_free(vae);
+        return NULL;
+    }
+    vae->encoder->fc_mu->stride  = 1;
+    vae->encoder->fc_mu->padding = 1;  /* k=3 SAME */
+
+    /* fc_logvar: audio_vae.encoder.fc_logvar */
+    vae->encoder->fc_logvar = wnconv_create_and_load(
+        "audio_vae.encoder.fc_logvar", false, mmap_data, idx);
+    if (!vae->encoder->fc_logvar) {
+        LOG_ERROR("audio_vae_create: missing fc_logvar");
+        audio_vae_free(vae);
+        return NULL;
+    }
+    vae->encoder->fc_logvar->stride  = 1;
+    vae->encoder->fc_logvar->padding = 1;  /* k=3 SAME */
+
     LOG_INFO("AudioVAE V2 created: %d decoder blocks with %d res blocks each, "
              "conv_in=%d->%d proj_up=%d->%d conv_out=%d->%d",
              AUDIOVAE_NUM_DECODER_BLOCKS, AUDIOVAE_RES_BLOCKS_PER_BLOCK,
              dec->conv_in->in_channels, dec->conv_in->out_channels,
              dec->proj_up->in_channels, dec->proj_up->out_channels,
              dec->conv_out->in_channels, dec->conv_out->out_channels);
+
+    LOG_INFO("AudioVAE encoder loaded: conv_in=%d->%d fc_mu=%d->%d fc_logvar=%d->%d",
+             vae->encoder->conv_in->in_channels, vae->encoder->conv_in->out_channels,
+             vae->encoder->fc_mu->in_channels, vae->encoder->fc_mu->out_channels,
+             vae->encoder->fc_logvar->in_channels, vae->encoder->fc_logvar->out_channels);
 
     return vae;
 }
@@ -639,8 +886,14 @@ AudioVAE* audio_vae_create(const VoxCPMConfig* config, const uint8_t* mmap_data,
 void audio_vae_free(AudioVAE* vae) {
     if (!vae) return;
 
-    /* Free encoder (stub) */
+    /* Free encoder */
     if (vae->encoder) {
+        wnconv_free(vae->encoder->conv_in);
+        for (int i = 0; i < 4; i++) {
+            audio_vae_encoder_block_free(&vae->encoder->blocks[i]);
+        }
+        wnconv_free(vae->encoder->fc_mu);
+        wnconv_free(vae->encoder->fc_logvar);
         free(vae->encoder);
     }
 
@@ -845,15 +1098,129 @@ cleanup:
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * Public API — audio_vae_encode (stub for Phase 3)
+ * Public API — audio_vae_encode
+ *
+ * Encodes waveform to latent at 16kHz rate.
+ *
+ * Input:  waveform  [batch, samples]   (16kHz PCM waveform)
+ * Output: latent    [batch, T_enc, latent_dim]
+ *
+ * Forward pass:
+ *   1. Reshape waveform [B, T] → [B, 1, T]
+ *   2. conv_in:   [B, 1, T] → [B, encoder_dim, T]     (k=7, SAME)
+ *   3. 4× Encoder blocks (each: 3×ResSubBlock → Snake → StridedConv)
+ *        rate: 2 → 5 → 8 → 8, channels: 128→256→512→1024→2048
+ *      After block 3: [B, 2048, T_enc]
+ *   4. fc_mu:     [B, 2048, T_enc] → [B, latent_dim, T_enc] (k=3, SAME)
+ *   5. Permute from [B, D, T] to [B, T, D]
  * ═══════════════════════════════════════════════════════════════ */
 VoxCPMError audio_vae_encode(
     const AudioVAE* vae,
     const Tensor* waveform,
     Tensor* latent)
 {
-    (void)vae;
-    (void)waveform;
-    (void)latent;
-    return VOXCPM_ERR_UNSUPPORTED;
+    if (!vae || !waveform || !latent) return VOXCPM_ERR_INTERNAL;
+    if (!vae->encoder || !vae->encoder->conv_in) return VOXCPM_ERR_INTERNAL;
+    AudioVAEEncoder* enc = vae->encoder;
+
+    /* ── Input validation ── */
+    int wf_ndim = waveform->ndim;
+    if (wf_ndim != 1 && wf_ndim != 2) {
+        LOG_ERROR("VAE ENC01: waveform ndim=%d", wf_ndim);
+        return VOXCPM_ERR_SHAPE_MISMATCH;
+    }
+    int batch = (wf_ndim == 2) ? waveform->shape[0] : 1;
+    int T     = (wf_ndim == 2) ? waveform->shape[1] : (int)waveform->size;
+    if (T <= 0) {
+        LOG_ERROR("VAE ENC02: empty waveform T=%d", T);
+        return VOXCPM_ERR_SHAPE_MISMATCH;
+    }
+
+    /* Validate latent shape — expect [B, T_enc, latent_dim] */
+    if (latent->ndim != 3) {
+        LOG_ERROR("VAE ENC03: latent ndim=%d != 3", latent->ndim);
+        return VOXCPM_ERR_SHAPE_MISMATCH;
+    }
+    if (latent->shape[0] != batch) {
+        LOG_ERROR("VAE ENC04: latent batch=%d != waveform batch=%d", latent->shape[0], batch);
+        return VOXCPM_ERR_SHAPE_MISMATCH;
+    }
+    if (latent->shape[2] != vae->latent_dim) {
+        LOG_ERROR("VAE ENC05: latent dim=%d != %d", latent->shape[2], vae->latent_dim);
+        return VOXCPM_ERR_SHAPE_MISMATCH;
+    }
+
+    VoxCPMError err = VOXCPM_SUCCESS;
+    Tensor* h = NULL;  /* current activation tensor */
+
+    /* Step 1: Reshape waveform [B, T] → [B, 1, T] */
+    h = tensor_create(3, (int[]){batch, 1, T});
+    if (!h) { err = VOXCPM_ERR_OOM; goto cleanup; }
+
+    memcpy(h->data, waveform->data, (size_t)batch * (size_t)T * sizeof(float));
+
+    LOG_DEBUG("VAE ENC: conv_in input [%d,%d,%d]", batch, 1, T);
+
+    /* Step 2: conv_in [B, 1, T] → [B, encoder_dim, T] (k=7, SAME) */
+    {
+        int out_c = enc->conv_in->out_channels;  /* 128 */
+        int T_out = (T + 2 * enc->conv_in->padding
+                     - enc->conv_in->kernel_size)
+                    / enc->conv_in->stride + 1;
+        Tensor* conv_out = tensor_create(3, (int[]){batch, out_c, T_out});
+        if (!conv_out) { err = VOXCPM_ERR_OOM; goto cleanup; }
+
+        err = wnconv_forward(enc->conv_in, h, conv_out);
+        tensor_free(h);
+        if (err) { tensor_free(conv_out); LOG_ERROR("VAE ENC10: conv_in failed"); goto cleanup; }
+        h = conv_out;
+    }
+
+    LOG_DEBUG("VAE ENC: after conv_in [%d,%d,%d]", h->shape[0], h->shape[1], h->shape[2]);
+
+    /* Steps 3-6: Encoder blocks 0-3 (each downsamples) */
+    for (int i = 0; i < 4; i++) {
+        err = encoder_block_forward(&enc->blocks[i], &h);
+        if (err) { LOG_ERROR("VAE ENC11: encoder block %d failed", i); goto cleanup; }
+        LOG_DEBUG("VAE ENC: after block %d [%d,%d,%d]", i, h->shape[0], h->shape[1], h->shape[2]);
+    }
+
+    /* h is now [B, 2048, T_enc] */
+    int T_enc = h->shape[2];
+
+    /* Validate latent T dimension matches encoder output */
+    if (latent->shape[1] != T_enc) {
+        LOG_ERROR("VAE ENC06: latent T_enc=%d != encoder T_enc=%d", latent->shape[1], T_enc);
+        err = VOXCPM_ERR_SHAPE_MISMATCH;
+        goto cleanup;
+    }
+
+    /* Step 7: fc_mu [B, 2048, T_enc] → [B, latent_dim, T_enc] (k=3, SAME) */
+    {
+        int mu_c = enc->fc_mu->out_channels;  /* latent_dim */
+        Tensor* mu_out = tensor_create(3, (int[]){batch, mu_c, T_enc});
+        if (!mu_out) { err = VOXCPM_ERR_OOM; goto cleanup; }
+
+        err = wnconv_forward(enc->fc_mu, h, mu_out);
+        tensor_free(h);
+        if (err) { tensor_free(mu_out); goto cleanup; }
+        h = mu_out;
+    }
+
+    /* Step 8: Permute from [B, D, T] → [B, T, D] to match latent output layout */
+    {
+        int axes[3] = {0, 2, 1};  /* [B, D, T] -> [B, T, D] */
+        err = tensor_permute(h, latent, axes);
+        tensor_free(h);
+        h = NULL;
+        if (err) { LOG_ERROR("VAE ENC20: permute failed"); goto cleanup; }
+    }
+
+    LOG_DEBUG("VAE ENC: output latent [%d,%d,%d]",
+              latent->shape[0], latent->shape[1], latent->shape[2]);
+    return VOXCPM_SUCCESS;
+
+cleanup:
+    tensor_free(h);
+    return err;
 }

@@ -87,6 +87,8 @@ Tensor* tensor_create(int ndim, const int* shape) {
 
     t->is_cuda = false;
     t->is_owned = true;
+    t->is_fp16 = false;
+    t->data_fp16 = NULL;
     t->name[0] = '\0';
 
     return t;
@@ -110,6 +112,8 @@ Tensor* tensor_create_from_buffer(int ndim, const int* shape, float* data) {
     t->data = data;
     t->is_cuda = false;
     t->is_owned = false;
+    t->is_fp16 = false;
+    t->data_fp16 = NULL;
     t->name[0] = '\0';
 
     return t;
@@ -129,8 +133,35 @@ void tensor_free(Tensor* t) {
     if (t->is_owned && t->data) {
         free(t->data);
     }
+    if (t->is_owned && t->data_fp16) {
+        free(t->data_fp16);
+    }
     free(t->shape);
     free(t);
+}
+
+/* Convert fp16 tensor to fp32 in-place */
+VoxCPMError tensor_ensure_fp32(Tensor* t) {
+    if (!t) return VOXCPM_ERR_INTERNAL;
+    if (!t->is_fp16 || !t->data_fp16) return VOXCPM_SUCCESS;
+    if (t->is_cuda) return VOXCPM_ERR_INTERNAL; /* cannot convert on GPU */
+
+    size_t n = t->size;
+    float* fp32_data = (float*)malloc(n * sizeof(float));
+    if (!fp32_data) return VOXCPM_ERR_OOM;
+
+    for (size_t i = 0; i < n; i++) {
+        fp32_data[i] = fp16_to_fp32(t->data_fp16[i]);
+    }
+
+    if (t->is_owned) {
+        free(t->data_fp16);
+    }
+    t->data_fp16 = NULL;
+    t->data = fp32_data;
+    t->is_fp16 = false;
+    t->is_owned = true;
+    return VOXCPM_SUCCESS;
 }
 
 VoxCPMError tensor_copy(Tensor* dst, const Tensor* src) {
@@ -286,6 +317,7 @@ void tensor_set(Tensor* t, int i, int j, int k, int l, float val) {
 
 void tensor_fill(Tensor* t, float val) {
     if (!t || !t->data) return;
+    if (t->is_fp16) return; /* Cannot fill fp16 tensor with float value */
     for (size_t i = 0; i < t->size; i++) {
         t->data[i] = val;
     }
@@ -472,7 +504,55 @@ VoxCPMError tensor_matmul(const Tensor* a, const Tensor* b, Tensor* out) {
     if (b->shape[0] != K) return VOXCPM_ERR_SHAPE_MISMATCH;
     if (out->shape[0] != M || out->shape[1] != N) return VOXCPM_ERR_SHAPE_MISMATCH;
 
-    // Naive triple-loop matmul (CPU reference implementation)
+    // Handle fp16 B (weight) tensor — convert each column on-the-fly
+    if (b->is_fp16) {
+        float* b_col = (float*)malloc((size_t)K * sizeof(float));
+        if (!b_col) return VOXCPM_ERR_OOM;
+
+        for (int j = 0; j < N; j++) {
+            // Convert B[:,j] from fp16 to fp32 (one column at a time)
+            for (int k = 0; k < K; k++) {
+                b_col[k] = fp16_to_fp32(b->data_fp16[(size_t)k * N + j]);
+            }
+
+            // Compute C[:,j] = A @ B[:,j]
+            for (int i = 0; i < M; i++) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; k++) {
+                    sum += a->data[(size_t)i * K + k] * b_col[k];
+                }
+                out->data[(size_t)i * N + j] = sum;
+            }
+        }
+        free(b_col);
+        return VOXCPM_SUCCESS;
+    }
+
+    // Handle fp16 A (weight) tensor — convert each row on-the-fly
+    if (a->is_fp16) {
+        float* a_row = (float*)malloc((size_t)K * sizeof(float));
+        if (!a_row) return VOXCPM_ERR_OOM;
+
+        for (int i = 0; i < M; i++) {
+            // Convert A[i,:] from fp16 to fp32
+            for (int k = 0; k < K; k++) {
+                a_row[k] = fp16_to_fp32(a->data_fp16[(size_t)i * K + k]);
+            }
+
+            // Compute C[i,:] = A_row @ B
+            for (int j = 0; j < N; j++) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; k++) {
+                    sum += a_row[k] * b->data[(size_t)k * N + j];
+                }
+                out->data[(size_t)i * N + j] = sum;
+            }
+        }
+        free(a_row);
+        return VOXCPM_SUCCESS;
+    }
+
+    // Naive triple-loop matmul (CPU reference implementation, both FP32)
     // OPTME: Will be optimized with loop interchange, tiling, SIMD in later phases
     for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {
@@ -536,6 +616,43 @@ VoxCPMError tensor_matmul_nt(const Tensor* a, const Tensor* b, Tensor* out) {
 
     if (b->shape[1] != K) return VOXCPM_ERR_SHAPE_MISMATCH;
     if (out->shape[0] != M || out->shape[1] != N) return VOXCPM_ERR_SHAPE_MISMATCH;
+
+#ifdef VOXCPM_CUDA
+    // Try CUDA-accelerated matmul first.
+    // tensor_matmul_nt_cuda handles auto-upload of CPU inputs and auto-download
+    // if output is CPU-resident. Falls back to CPU if CUDA is not initialized.
+    {
+        VoxCPMError cuda_err = tensor_matmul_nt_cuda(a, b, out);
+        if (cuda_err != VOXCPM_ERR_CUDA_NOT_FOUND) {
+            return cuda_err;  // Success or real error
+        }
+        // CUDA not available — fall through to CPU path
+    }
+#endif
+
+    // Handle FP16 B (weight) tensor: convert each row on-the-fly
+    if (b->is_fp16) {
+        float* b_row = (float*)malloc((size_t)K * sizeof(float));
+        if (!b_row) return VOXCPM_ERR_OOM;
+
+        for (int j = 0; j < N; j++) {
+            // Convert B[j,:] from fp16 to fp32 (one row at a time)
+            for (int k = 0; k < K; k++) {
+                b_row[k] = fp16_to_fp32(b->data_fp16[(size_t)j * K + k]);
+            }
+
+            // Compute C[:,j] = A @ B_row^T
+            for (int i = 0; i < M; i++) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; k++) {
+                    sum += a->data[(size_t)i * K + k] * b_row[k];
+                }
+                out->data[(size_t)i * N + j] = sum;
+            }
+        }
+        free(b_row);
+        return VOXCPM_SUCCESS;
+    }
 
     for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {
@@ -665,8 +782,16 @@ VoxCPMError tensor_layer_norm(
         for (int d = 0; d < d_model; d++) {
             size_t idx = (size_t)p * d_model + (size_t)d;
             float normalized = (float)(((double)x->data[idx] - mean) * inv_std);
-            if (weight) normalized *= weight->data[d];
-            if (bias)   normalized += bias->data[d];
+            if (weight) {
+                normalized *= weight->is_fp16
+                    ? fp16_to_fp32(weight->data_fp16[d])
+                    : weight->data[d];
+            }
+            if (bias) {
+                normalized += bias->is_fp16
+                    ? fp16_to_fp32(bias->data_fp16[d])
+                    : bias->data[d];
+            }
             out->data[idx] = normalized;
         }
     }
@@ -702,7 +827,11 @@ VoxCPMError tensor_rms_norm(
         for (int d = 0; d < d_model; d++) {
             size_t idx = (size_t)p * d_model + (size_t)d;
             float normalized = (float)((double)x->data[idx] * inv_rms);
-            if (weight) normalized *= weight->data[d];
+            if (weight) {
+                normalized *= weight->is_fp16
+                    ? fp16_to_fp32(weight->data_fp16[d])
+                    : weight->data[d];
+            }
             out->data[idx] = normalized;
         }
     }

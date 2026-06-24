@@ -368,16 +368,6 @@ typedef struct {
     bool    is_transpose;
 } WNConv;
 
-typedef struct {
-    WNConv*  conv_in;               /* first conv: (1 -> encoder_dim) kernel=7 */
-    WNConv*  conv_blocks[4];        /* 4 encoder blocks (rates=[2,5,8,8]) */
-    WNConv*  fc_mu;                 /* mu head conv: (enc_dim*16 -> latent_dim) kernel=3 */
-    WNConv*  fc_logvar;             /* logvar head conv */
-
-    int      encoder_dim;            /* 128 */
-    int      latent_dim;             /* 64 */
-} AudioVAEEncoder;
-
 /* ── Residual sub-block: Snake → DepthwiseConv(k=7) → Snake → PointwiseConv(k=1) ── */
 typedef struct {
     WNConv*  conv_depthwise;        /* depthwise Conv1d: k=7, groups=out_channels, no bias */
@@ -385,6 +375,24 @@ typedef struct {
     Tensor*  snake_alpha1;          /* Snake alpha before depthwise conv */
     Tensor*  snake_alpha2;          /* Snake alpha before pointwise conv */
 } AudioVAEResBlock;
+
+/* ── Encoder block: 3×ResidualSubBlock → Snake → StridedConv ── */
+typedef struct {
+    Tensor*          stride_alpha;   /* Snake alpha before stride conv */
+    WNConv*          stride_conv;    /* Strided Conv1D for downsampling */
+    AudioVAEResBlock res_blocks[3];  /* 3 residual sub-blocks */
+    int              num_res_blocks; /* 3 */
+} AudioVAEEncoderBlock;
+
+typedef struct {
+    WNConv*               conv_in;               /* first conv: (1 -> encoder_dim) kernel=7 */
+    AudioVAEEncoderBlock  blocks[4];             /* 4 encoder downsampling blocks */
+    WNConv*               fc_mu;                 /* mu head conv: (2048 -> latent_dim) kernel=3 */
+    WNConv*               fc_logvar;             /* logvar head conv: (2048 -> latent_dim) kernel=3 */
+
+    int                   encoder_dim;           /* 128 */
+    int                   latent_dim;            /* 64 */
+} AudioVAEEncoder;
 
 /* ── Decoder block: Snake → ConvTR → 3×ResidualSubBlock ── */
 typedef struct {

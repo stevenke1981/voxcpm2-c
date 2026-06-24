@@ -50,6 +50,8 @@ typedef struct {
     size_t  size;           /* total number of elements */
     bool    is_cuda;        /* true if data lives on GPU */
     bool    is_owned;       /* true if data was allocated internally */
+    uint16_t* data_fp16;    /* FP16 raw data pointer (for weights stored as FP16). Non-NULL if is_fp16=true */
+    bool      is_fp16;      /* true if this tensor stores FP16 data in data_fp16 */
     char    name[TENSOR_MAX_NAME]; /* optional debug name */
 } Tensor;
 
@@ -70,6 +72,10 @@ Tensor* tensor_scalar(float value);
 
 /* Free all resources. Safe to call with NULL. */
 void tensor_free(Tensor* t);
+
+/* Convert fp16 tensor to fp32 in-place. If t is already fp32 or is_fp16=false, no-op.
+ * Allocates t->data and converts all elements, then frees t->data_fp16. */
+VoxCPMError tensor_ensure_fp32(Tensor* t);
 
 /* Deep copy: dst gets its own data copy.
  * dst is re-allocated if shape mismatch. */
@@ -302,6 +308,67 @@ float tensor_mean(const Tensor* t);
 /* Compute min/max values and their indices. */
 void tensor_minmax(const Tensor* t, float* min_val, float* max_val,
                     int* min_idx, int* max_idx);
+
+/* ═══════════════════════════════════════════════════════════════
+ * CUDA / GPU Acceleration
+ * ═══════════════════════════════════════════════════════════════ */
+
+#ifdef VOXCPM_CUDA
+
+/* Initialize CUDA + cuBLAS (call once at startup).
+ * Returns VOXCPM_ERR_CUDA_NOT_FOUND if no GPU available. */
+VoxCPMError tensor_cuda_init(void);
+
+/* Shutdown CUDA + cuBLAS. */
+void tensor_cuda_shutdown(void);
+
+/* Transfer tensor data between CPU and GPU.
+ * Sets t->is_cuda accordingly. */
+VoxCPMError tensor_to_cuda(Tensor* t);
+VoxCPMError tensor_to_cpu(Tensor* t);
+
+/* Free GPU memory for this tensor (does NOT free CPU data). */
+VoxCPMError tensor_cuda_free(Tensor* t);
+
+/* cuBLAS-accelerated matmul: C = A @ B^T
+ * A [M,K], B [N,K], out [M,N] — all row-major.
+ * Inputs can be CPU (auto-uploaded); output must be GPU-resident. */
+VoxCPMError tensor_matmul_nt_cuda(
+    const Tensor* a,
+    const Tensor* b,
+    Tensor* out
+);
+
+#endif /* VOXCPM_CUDA */
+
+/* ═══════════════════════════════════════════════════════════════
+ * FP16 conversion helpers
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* Convert IEEE 754 FP16 (uint16_t) to FP32 (float).
+ * Uses type-punning via union (C99+ well-defined). */
+static inline float fp16_to_fp32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp  = (uint32_t)((h >> 10) & 0x1F);
+    uint32_t mant = (uint32_t)(h & 0x3FF);
+    union { uint32_t u; float f; } conv;
+    if (exp == 0) {
+        if (mant == 0) return 0.0f;
+        /* Subnormal: normalize */
+        exp = 1;
+        while (!(mant & 0x400)) { mant <<= 1; exp--; }
+        mant &= 0x3FF;
+        conv.u = sign | ((exp + 112) << 23) | (mant << 13);
+        return conv.f;
+    } else if (exp == 31) {
+        /* Infinity or NaN */
+        conv.u = sign | 0x7F800000 | (mant << 13);
+        return conv.f;
+    }
+    /* Normal number */
+    conv.u = sign | ((exp + 112) << 23) | (mant << 13);
+    return conv.f;
+}
 
 #ifdef __cplusplus
 }

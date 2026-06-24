@@ -126,7 +126,7 @@ VoxCPMGenConfig voxcpm_gen_config_default(void) {
     cfg.denoise = true;
     cfg.normalize = true;
     cfg.seed = 0;
-    cfg.max_new_tokens = 1024;
+    cfg.max_new_tokens = 4;
     cfg.temperature = 1.0f;
     cfg.timeout_ms = 0;
     return cfg;
@@ -443,6 +443,19 @@ VoxCPMModel* voxcpm_create(const VoxCPMModelConfig* config, VoxCPMError* err) {
         }
     }
 
+    // ─── Release mmap regions ──────────────────────────────
+    // All weight data has been deep-copied into tensors via weight_load_tensor.
+    // The mmap regions (4.36 GB fp16 model → 8.72 GB fp32 tensors) are no longer
+    // needed and can be freed to reduce memory pressure.
+    if (model->weights_mmap) {
+        mmap_close(model->weights_mmap);
+        model->weights_mmap = NULL;
+    }
+    if (model->audiovae_mmap) {
+        mmap_close(model->audiovae_mmap);
+        model->audiovae_mmap = NULL;
+    }
+
     if (err) *err = VOXCPM_SUCCESS;
     return model;
 }
@@ -599,9 +612,16 @@ VoxCPMError voxcpm_generate(
         if (token_id < 0 || token_id >= embed->shape[0]) {
             token_id = 0;  // fallback to UNK
         }
-        float* src = embed->data + (size_t)token_id * (size_t)D;
         float* dst = hidden->data + (size_t)s * (size_t)D;
-        memcpy(dst, src, (size_t)D * sizeof(float));
+        if (embed->is_fp16) {
+            const uint16_t* src16 = embed->data_fp16 + (size_t)token_id * (size_t)D;
+            for (int j = 0; j < D; j++) {
+                dst[j] = fp16_to_fp32(src16[j]);
+            }
+        } else {
+            float* src = embed->data + (size_t)token_id * (size_t)D;
+            memcpy(dst, src, (size_t)D * sizeof(float));
+        }
     }
     free(tokens);
 
@@ -652,134 +672,55 @@ VoxCPMError voxcpm_generate(
         if (err) { LOG_ERROR("tensor_add failed: err=%d", err); tensor_free(hidden); return err; }
     }
 
-    // ─── Step 6: Create cond from text hidden ───────────────
-    // Project hidden [B, T, 2048] → dit_hidden [B, T, 1024] via res_to_dit_proj.
-    // Then project to feat_dim [B*T, 1024] → [B*T, 64] via LocDiT's out_proj.
-    // Permute to [B, 64, T] = cond.
-    Tensor* cond = NULL;
-    Tensor* dit_hidden_flat = NULL; /* [B*T, DH] */
-    Tensor* cond_flat = NULL;       /* [B*T, F] */
-    if (model->res_to_dit_proj_weight && model->loc_dit &&
-        model->loc_dit->out_proj_weight) {
-        LOG_INFO("Creating cond from text hidden [B=%d, T=%d, D=%d, DH=%d, F=%d]...",
-                 B, n_tokens, D, DH, F);
+    // ─── Step 6: Save text hidden for future fusion ──────────
+    // clone before freeing — we still need hidden for mu extraction below
+    Tensor* text_hidden = tensor_clone(hidden);
+    if (!text_hidden) { LOG_ERROR("text_hidden OOM"); tensor_free(hidden); return VOXCPM_ERR_OOM; }
 
-        // 6a: Copy hidden [B,T,D] → flat [B*T,D], then project to [B*T, DH]
-        Tensor* hidden_flat = tensor_create(2, (int[]){ B * n_tokens, D });
-        if (!hidden_flat) { tensor_free(hidden); return VOXCPM_ERR_OOM; }
-        memcpy(hidden_flat->data, hidden->data,
-               (size_t)(B * n_tokens) * (size_t)D * sizeof(float));
-
-        LOG_INFO("  matmul: hidden_flat[%d,%d] @ res_to_dit_proj[%d,%d]^T → dit_hidden_flat[%d,%d]",
-                 hidden_flat->shape[0], hidden_flat->shape[1],
-                 model->res_to_dit_proj_weight->shape[0],
-                 model->res_to_dit_proj_weight->shape[1],
-                 B * n_tokens, DH);
-
-        dit_hidden_flat = tensor_create(2, (int[]){ B * n_tokens, DH });
-        if (!dit_hidden_flat) { tensor_free(hidden); tensor_free(hidden_flat); return VOXCPM_ERR_OOM; }
-        err = tensor_matmul_nt(hidden_flat, model->res_to_dit_proj_weight,
-                               dit_hidden_flat);
-        tensor_free(hidden_flat);
-        if (err) {
-            LOG_ERROR("res_to_dit_proj matmul failed: err=%d", err);
-            tensor_free(hidden); tensor_free(dit_hidden_flat); return err;
-        }
-        LOG_INFO("  res_to_dit_proj done");
-
-        if (model->res_to_dit_proj_bias) {
-            for (int i = 0; i < B * n_tokens * DH; i++) {
-                dit_hidden_flat->data[i] +=
-                    model->res_to_dit_proj_bias->data[i % DH];
-            }
-        }
-
-        // 6b: out_proj (dit_hidden→feat_dim): [B*T, 1024] → [B*T, 64]
-        cond_flat = tensor_create(2, (int[]){ B * n_tokens, F });
-        if (!cond_flat) { tensor_free(hidden); tensor_free(dit_hidden_flat); return VOXCPM_ERR_OOM; }
-        err = tensor_matmul_nt(dit_hidden_flat, model->loc_dit->out_proj_weight,
-                               cond_flat);
-        tensor_free(dit_hidden_flat);
-        if (err) { tensor_free(hidden); tensor_free(cond_flat); return err; }
-        if (model->loc_dit->out_proj_bias) {
-            for (int i = 0; i < B * n_tokens * F; i++) {
-                cond_flat->data[i] +=
-                    model->loc_dit->out_proj_bias->data[i % F];
-            }
-        }
-
-        // 6c: Reshape to [B, T, F] then permute to [B, F, T] = cond
-        Tensor* cond_3d = tensor_create(3, (int[]){ B, n_tokens, F });
-        if (!cond_3d) { tensor_free(hidden); tensor_free(cond_flat); return VOXCPM_ERR_OOM; }
-        memcpy(cond_3d->data, cond_flat->data,
-               (size_t)B * (size_t)n_tokens * (size_t)F * sizeof(float));
-        tensor_free(cond_flat);
-
-        cond = tensor_create(3, (int[]){ B, F, n_tokens });
-        if (!cond) { tensor_free(hidden); tensor_free(cond_3d); return VOXCPM_ERR_OOM; }
-        err = tensor_permute(cond_3d, cond, (int[]){ 0, 2, 1 });
-        tensor_free(cond_3d);
-        if (err) { tensor_free(hidden); tensor_free(cond); return err; }
-
-        LOG_INFO("Cond created: shape [%d,%d,%d]", B, F, n_tokens);
-    } else {
-        LOG_WARN("res_to_dit_proj or out_proj not found; using empty cond");
-        cond = tensor_create(3, (int[]){ B, F, 0 });
-        if (!cond) { tensor_free(hidden); return VOXCPM_ERR_OOM; }
-    }
-
-    // ─── Step 7: Extract mu vector ──────────────────────────
-    // Take last token's hidden state and project from d_model → dit_hidden
+    // ─── Step 7: Extract mu vector from text hidden ─────────
     Tensor* last_hidden = tensor_create(2, (int[]){ B, D });
-    if (!last_hidden) { tensor_free(hidden); tensor_free(cond); return VOXCPM_ERR_OOM; }
+    if (!last_hidden) { tensor_free(hidden); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
     {
         float* src = hidden->data + (size_t)(n_tokens - 1) * (size_t)D;
         memcpy(last_hidden->data, src, (size_t)D * sizeof(float));
     }
-    tensor_free(hidden);
+    tensor_free(hidden);  // hidden no longer needed
 
     Tensor* mu = NULL;
     if (model->lm_to_dit_weight) {
         mu = tensor_create(2, (int[]){ B, DH });
-        if (!mu) { tensor_free(last_hidden); tensor_free(cond); return VOXCPM_ERR_OOM; }
+        if (!mu) { tensor_free(last_hidden); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
         err = tensor_matmul_nt(last_hidden, model->lm_to_dit_weight, mu);
-        if (err) { tensor_free(last_hidden); tensor_free(mu); tensor_free(cond); return err; }
+        if (err) { tensor_free(last_hidden); tensor_free(mu); tensor_free(text_hidden); return err; }
         if (model->lm_to_dit_bias) {
-            for (int i = 0; i < DH; i++) {
-                mu->data[i] += model->lm_to_dit_bias->data[i];
+            if (model->lm_to_dit_bias->is_fp16) {
+                for (int i = 0; i < DH; i++)
+                    mu->data[i] += fp16_to_fp32(model->lm_to_dit_bias->data_fp16[i]);
+            } else {
+                for (int i = 0; i < DH; i++)
+                    mu->data[i] += model->lm_to_dit_bias->data[i];
             }
         }
     } else {
         mu = tensor_create(2, (int[]){ B, DH });
-        if (!mu) { tensor_free(last_hidden); tensor_free(cond); return VOXCPM_ERR_OOM; }
+        if (!mu) { tensor_free(last_hidden); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
         memcpy(mu->data, last_hidden->data, (size_t)DH * sizeof(float));
         LOG_WARN("lm_to_dit_proj not found; using first-half slice as mu");
     }
     tensor_free(last_hidden);
 
-    // ─── Step 8: LocDiT diffusion ───────────────────────────
-    Tensor* latent = tensor_create(3, (int[]){ B, F, P });
-    if (!latent) { tensor_free(mu); tensor_free(cond); return VOXCPM_ERR_OOM; }
+    // ─── Step 8: Autoregressive patch generation loop ────────
+    // Determine number of patches from max_new_tokens.
+    // Each patch = P VAE frames = ~0.16s of 48kHz audio.
+    const int n_patches = config->max_new_tokens > 0
+        ? (config->max_new_tokens + P - 1) / P  // ceil division
+        : 4;   // default: ~0.6 seconds
 
-    err = loc_dit_sample(
-        model->loc_dit, mu, cond,
-        config->inference_timesteps > 0 ? config->inference_timesteps : 10,
-        config->cfg_value > 0.0f ? config->cfg_value : 2.0f,
-        latent
-    );
-    tensor_free(mu);
-    tensor_free(cond);
-    if (err) { LOG_ERROR("loc_dit_sample failed"); tensor_free(latent); return err; }
+    LOG_INFO("Generating %d patches (%d tokens, mu=[%d,%d], text_len=%d)...",
+             n_patches, config->max_new_tokens, B, DH, text_hidden->shape[1]);
 
-    // ─── Step 9: Permute latent for AudioVAE ────────────────
-    Tensor* latent_vae = tensor_create(3, (int[]){ B, P, F });
-    if (!latent_vae) { tensor_free(latent); return VOXCPM_ERR_OOM; }
-    err = tensor_permute(latent, latent_vae, (int[]){ 0, 2, 1 });
-    tensor_free(latent);
-    if (err) { LOG_ERROR("tensor_permute latent failed"); tensor_free(latent_vae); return err; }
-
-    // ─── Step 10: AudioVAE decode ───────────────────────────
-    int total_samples = P * 1920; // fallback
+    // Compute samples-per-patch from AudioVAE decoder strides
+    int samples_per_patch = P * 1920; // fallback
     if (model->audio_vae && model->audio_vae->decoder) {
         AudioVAEDecoder* dec = model->audio_vae->decoder;
         int T = P;
@@ -787,31 +728,247 @@ VoxCPMError voxcpm_generate(
             const WNConv* ct = dec->decoder_blocks[i].convtr;
             T = (T - 1) * ct->stride - 2 * ct->padding + ct->kernel_size;
         }
-        total_samples = T;
+        samples_per_patch = T;
     }
 
-    Tensor* waveform = tensor_create(1, (int[]){ B * total_samples });
-    if (!waveform) { tensor_free(latent_vae); return VOXCPM_ERR_OOM; }
-    if (model->audio_vae) {
-        err = audio_vae_decode(model->audio_vae, latent_vae, waveform);
-    } else {
-        tensor_zero(waveform);
-        err = VOXCPM_SUCCESS;
+    // Allocate output buffer (accumulate all patches)
+    size_t max_total = (size_t)n_patches * (size_t)samples_per_patch;
+    float* all_samples = (float*)malloc(max_total * sizeof(float));
+    if (!all_samples) { tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+    size_t total_samples = 0;
+
+    // Patch loop — cond and acc_latent managed across iterations
+    Tensor* cond = NULL;
+    Tensor* acc_latent = NULL;
+    for (int p = 0; p < n_patches; p++) {
+        LOG_INFO("Patch %d/%d...", p + 1, n_patches);
+
+        // ─── Build cond ───
+        // Patch 0: empty cond (no audio context yet)
+        // Patches 1+: cond set from previous iteration's audio encoding
+        if (p == 0) {
+            cond = tensor_create(3, (int[]){ B, F, 0 });
+            if (!cond) { free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+        }
+        // else: cond is already set from the encoding step at end of previous iteration
+
+        // ─── LocDiT diffusion sample ───
+        Tensor* latent = tensor_create(3, (int[]){ B, F, P });
+        if (!latent) { tensor_free(cond); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+
+        err = loc_dit_sample(
+            model->loc_dit, mu, cond,
+            config->inference_timesteps > 0 ? config->inference_timesteps : 10,
+            config->cfg_value > 0.0f ? config->cfg_value : 2.0f,
+            latent
+        );
+        tensor_free(cond); cond = NULL;
+        if (err) { LOG_ERROR("loc_dit_sample failed at patch %d", p); tensor_free(latent); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return err; }
+
+        LOG_INFO("Patch %d: latent permute...", p);
+        // ─── Permute latent for AudioVAE ───
+        Tensor* latent_vae = tensor_create(3, (int[]){ B, P, F });
+        if (!latent_vae) { tensor_free(latent); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+        err = tensor_permute(latent, latent_vae, (int[]){ 0, 2, 1 });
+        tensor_free(latent);
+        if (err) { tensor_free(latent_vae); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return err; }
+
+        LOG_INFO("Patch %d: AudioVAE decode...", p);
+        // ─── AudioVAE decode ───
+        Tensor* waveform = tensor_create(1, (int[]){ B * samples_per_patch });
+        if (!waveform) { tensor_free(latent_vae); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+        if (model->audio_vae) {
+            err = audio_vae_decode(model->audio_vae, latent_vae, waveform);
+        } else {
+            tensor_zero(waveform);
+            err = VOXCPM_SUCCESS;
+        }
+        LOG_INFO("Patch %d: AudioVAE decode done, err=%d", p, err);
+        if (err) { tensor_free(latent_vae); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return err; }
+
+        // ─── Accumulate latent for autoregressive conditioning ──
+        // Use latent_vae (before free) as AR context for next patches.
+        // Also update mu via LocEnc → fusion → RALM.
+        if (p + 1 < n_patches) {
+            int T_enc_prev = acc_latent ? acc_latent->shape[1] : 0;
+            Tensor* new_acc = tensor_create(3, (int[]){ B, T_enc_prev + P, F });
+            if (!new_acc) {
+                tensor_free(latent_vae); tensor_free(waveform);
+                free(all_samples); tensor_free(mu); tensor_free(text_hidden);
+                return VOXCPM_ERR_OOM;
+            }
+            if (acc_latent) {
+                memcpy(new_acc->data, acc_latent->data,
+                       (size_t)B * (size_t)T_enc_prev * (size_t)F * sizeof(float));
+                tensor_free(acc_latent);
+            }
+            memcpy(new_acc->data + (size_t)B * (size_t)T_enc_prev * (size_t)F,
+                   latent_vae->data,
+                   (size_t)B * (size_t)P * (size_t)F * sizeof(float));
+            acc_latent = new_acc;
+
+            int T_enc = acc_latent->shape[1];
+            LOG_INFO("AR: accumulated latent [%d,%d,%d]", B, T_enc, F);
+
+            // Build cond: permute [B,T_enc,F] → [B,F,T_enc]
+            cond = tensor_create(3, (int[]){ B, F, T_enc });
+            if (!cond) {
+                tensor_free(latent_vae); tensor_free(waveform);
+                free(all_samples); tensor_free(mu); tensor_free(text_hidden);
+                return VOXCPM_ERR_OOM;
+            }
+            err = tensor_permute(acc_latent, cond, (int[]){ 0, 2, 1 });
+            if (err) {
+                LOG_ERROR("AR P01: permute failed");
+                tensor_free(cond); tensor_free(latent_vae); tensor_free(waveform);
+                free(all_samples); tensor_free(mu); tensor_free(text_hidden);
+                return err;
+            }
+
+            // ─── Update mu via LocEnc → enc_to_lm_proj → fusion → RALM → res_to_dit_proj ───
+            int T_groups = T_enc / P;
+            if (T_groups > 0 && model->loc_enc && model->enc_to_lm_proj_weight
+                && model->fusion_concat_proj_weight)
+            {
+                Tensor* loc_in = tensor_create(4, (int[]){ B, T_groups, P, F });
+                if (!loc_in) {
+                    tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform);
+                    free(all_samples); tensor_free(mu); tensor_free(text_hidden);
+                    return VOXCPM_ERR_OOM;
+                }
+                memcpy(loc_in->data, acc_latent->data,
+                       (size_t)B * (size_t)T_groups * (size_t)P * (size_t)F * sizeof(float));
+
+                Tensor* enc_out = tensor_create(3, (int[]){ B, T_groups, DH });
+                if (!enc_out) { tensor_free(loc_in); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+                err = loc_enc_forward(model->loc_enc, loc_in, enc_out);
+                tensor_free(loc_in);
+                if (err) { tensor_free(enc_out); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return err; }
+
+                // enc_to_lm_proj [B,T_groups,1024] → [B,T_groups,2048]
+                Tensor* enc_proj = tensor_create(3, (int[]){ B, T_groups, D });
+                if (!enc_proj) { tensor_free(enc_out); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+                {   Tensor* fi  = tensor_create_from_buffer(2, (int[]){B*T_groups, DH}, enc_out->data);
+                    Tensor* fo  = tensor_create_from_buffer(2, (int[]){B*T_groups, D}, enc_proj->data);
+                    if (!fi||!fo) { tensor_free(fi); tensor_free(fo); tensor_free(enc_out); tensor_free(enc_proj); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+                    err = tensor_matmul_nt(fi, model->enc_to_lm_proj_weight, fo);
+                    tensor_free(fi); tensor_free(fo);
+                    if (err) { tensor_free(enc_out); tensor_free(enc_proj); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return err; }
+                    if (model->enc_to_lm_proj_bias) {
+                        float* b = model->enc_to_lm_proj_bias->data;
+                        for (int bi = 0; bi < B*T_groups; bi++) {
+                            float* r = enc_proj->data + (size_t)bi * D;
+                            for (int j = 0; j < D; j++) r[j] += b[j];
+                        }
+                    }
+                }
+                tensor_free(enc_out);
+
+                // Fusion: concat enc_proj with text_hidden
+                int n_tok = text_hidden->shape[1];
+                int fused_T = (n_tok < T_groups) ? n_tok : T_groups;
+                Tensor* fused_in = tensor_create(3, (int[]){ B, fused_T, D*2 });
+                if (!fused_in) { tensor_free(enc_proj); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+                for (int bi = 0; bi < B; bi++) {
+                    for (int ti = 0; ti < fused_T; ti++) {
+                        float* d = fused_in->data + (size_t)bi*fused_T*D*2 + (size_t)ti*D*2;
+                        int ai = T_groups - fused_T + ti;
+                        int txti = n_tok - fused_T + ti;
+                        memcpy(d, enc_proj->data + (size_t)bi*T_groups*D + (size_t)ai*D, (size_t)D*sizeof(float));
+                        memcpy(d+D, text_hidden->data + (size_t)bi*n_tok*D + (size_t)txti*D, (size_t)D*sizeof(float));
+                    }
+                }
+
+                Tensor* fused_out = tensor_create(3, (int[]){ B, fused_T, D });
+                if (!fused_out) { tensor_free(fused_in); tensor_free(enc_proj); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+                {   Tensor* fi2 = tensor_create_from_buffer(2, (int[]){B*fused_T, D*2}, fused_in->data);
+                    Tensor* fo2 = tensor_create_from_buffer(2, (int[]){B*fused_T, D}, fused_out->data);
+                    if (!fi2||!fo2) { tensor_free(fi2); tensor_free(fo2); tensor_free(fused_in); tensor_free(fused_out); tensor_free(enc_proj); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+                    err = tensor_matmul_nt(fi2, model->fusion_concat_proj_weight, fo2);
+                    tensor_free(fi2); tensor_free(fo2);
+                    if (err) { tensor_free(fused_in); tensor_free(fused_out); tensor_free(enc_proj); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return err; }
+                    if (model->fusion_concat_proj_bias) {
+                        float* b = model->fusion_concat_proj_bias->data;
+                        for (int bi = 0; bi < B*fused_T; bi++) {
+                            float* r = fused_out->data + (size_t)bi*D;
+                            for (int j = 0; j < D; j++) r[j] += b[j];
+                        }
+                    }
+                }
+                tensor_free(fused_in);
+                tensor_free(enc_proj);
+
+                // RALM forward (residual)
+                Tensor* ralm_out = tensor_create(3, (int[]){ B, fused_T, D });
+                if (!ralm_out) { tensor_free(fused_out); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+                err = ralm_forward(model->ralm, fused_out, NULL, ralm_out);
+                if (err) { tensor_free(ralm_out); tensor_free(fused_out); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return err; }
+                err = tensor_add(fused_out, ralm_out, fused_out);
+                tensor_free(ralm_out);
+                if (err) { tensor_free(fused_out); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return err; }
+
+                // Last hidden → res_to_dit_proj → new mu
+                Tensor* last_fused = tensor_create(2, (int[]){ B, D });
+                if (!last_fused) { tensor_free(fused_out); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+                memcpy(last_fused->data, fused_out->data + (size_t)(fused_T-1)*D, (size_t)D*sizeof(float));
+                tensor_free(fused_out);
+
+                if (model->res_to_dit_proj_weight) {
+                    Tensor* new_mu = tensor_create(2, (int[]){ B, DH });
+                    if (!new_mu) { tensor_free(last_fused); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+                    err = tensor_matmul_nt(last_fused, model->res_to_dit_proj_weight, new_mu);
+                    tensor_free(last_fused);
+                    if (err) { tensor_free(new_mu); tensor_free(latent_vae); tensor_free(cond); tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return err; }
+                    if (model->res_to_dit_proj_bias) {
+                        float* b = model->res_to_dit_proj_bias->data;
+                        for (int i = 0; i < B*DH; i++) new_mu->data[i] += b[i];
+                    }
+                    tensor_free(mu);
+                    mu = new_mu;
+                    LOG_INFO("AR: mu updated via fusion→RALM→res_to_dit_proj");
+                } else {
+                    tensor_free(last_fused);
+                }
+            }
+        }
+
+        // ─── Now safe to free latent_vae ───
+        tensor_free(latent_vae);
+
+        // ─── Append to output ───
+        int n_samp = (int)waveform->size;
+        if (total_samples + (size_t)n_samp > max_total) {
+            max_total = total_samples + (size_t)n_samp;
+            float* tmp = (float*)realloc(all_samples, max_total * sizeof(float));
+            if (!tmp) { tensor_free(waveform); free(all_samples); tensor_free(mu); tensor_free(text_hidden); return VOXCPM_ERR_OOM; }
+            all_samples = tmp;
+        }
+        memcpy(all_samples + total_samples, waveform->data, (size_t)n_samp * sizeof(float));
+        total_samples += (size_t)n_samp;
+
+        tensor_free(waveform);
     }
-    tensor_free(latent_vae);
-    if (err) { LOG_ERROR("audio_vae_decode failed"); tensor_free(waveform); return err; }
 
-    // ─── Step 11: Normalize audio (peak to [-1, 1]) ─────────
-    audio_normalize(waveform);
+    // Cleanup accumulated latent
+    tensor_free(acc_latent);
 
-    // ─── Step 12: Copy to VoxCPMAudio ───────────────────────
-    output->num_samples = total_samples;
+    tensor_free(mu);
+    tensor_free(text_hidden);
+
+    // ─── Step 9: Normalize audio (peak to [-1, 1]) ──────────
+    {
+        Tensor* norm_t = tensor_create_from_buffer(1, (int[]){ (int)total_samples }, all_samples);
+        if (norm_t) {
+            audio_normalize(norm_t);
+            tensor_free(norm_t);
+        }
+    }
+
+    // ─── Step 10: Copy to VoxCPMAudio ───────────────────────
+    output->num_samples = (int)total_samples;
     output->sample_rate = model->config.sample_rate;
-    output->samples = (float*)malloc((size_t)total_samples * sizeof(float));
-    if (!output->samples) { tensor_free(waveform); return VOXCPM_ERR_OOM; }
-    memcpy(output->samples, waveform->data, (size_t)total_samples * sizeof(float));
+    output->samples = all_samples;  // transfer ownership
 
-    tensor_free(waveform);
     return VOXCPM_SUCCESS;
 }
 
@@ -1587,37 +1744,26 @@ VoxCPMError weight_load_tensor(
             break;
         }
         case VXCPM_DTYPE_FP16: {
-            /* Convert float16 -> float32 */
-            const uint16_t* f16 = (const uint16_t*)src;
-            float* dst = t->data;
-            for (int64_t i = 0; i < num_elems; i++) {
-                uint16_t h = f16[i];
-                /* FP16 -> FP32 conversion */
-                uint32_t sign = (uint32_t)(h >> 15) << 31;
-                uint32_t exp  = (uint32_t)((h >> 10) & 0x1F);
-                uint32_t mant = (uint32_t)(h & 0x3FF);
-
-                if (exp == 0) {
-                    /* Subnormal or zero */
-                    if (mant == 0) {
-                        dst[i] = 0.0f; /* zero */
-                    } else {
-                        /* Subnormal: normalize */
-                        exp = 1;
-                        while (!(mant & 0x400)) { mant <<= 1; exp--; }
-                        mant &= 0x3FF;
-                        uint32_t f = sign | ((exp + 112) << 23) | (mant << 13);
-                        memcpy(&dst[i], &f, sizeof(float));
-                    }
-                } else if (exp == 31) {
-                    /* Infinity or NaN */
-                    uint32_t f = sign | 0x7F800000 | (mant << 13);
-                    memcpy(&dst[i], &f, sizeof(float));
-                } else {
-                    /* Normal */
-                    uint32_t f = sign | ((exp + 112) << 23) | (mant << 13);
-                    memcpy(&dst[i], &f, sizeof(float));
+            /* Keep as FP16 — no conversion to FP32. Store raw fp16 data in data_fp16.
+             * Exception: 1D tensors (biases, norm weights) are tiny and are accessed
+             * directly as float* in many places (add_bias_2d, etc.), so convert them
+             * to fp32 immediately. */
+            if (ndim == 1) {
+                /* 1D tensor — convert to FP32 directly */
+                const uint16_t* f16 = (const uint16_t*)src;
+                float* dst = t->data;
+                for (int64_t i = 0; i < num_elems; i++) {
+                    dst[i] = fp16_to_fp32(f16[i]);
                 }
+            } else {
+                /* 2D+ tensor — keep as FP16 for memory efficiency */
+                size_t bytes = (size_t)num_elems * sizeof(uint16_t);
+                free(t->data);  /* free the unused FP32 buffer */
+                t->data = NULL;
+                t->data_fp16 = (uint16_t*)malloc(bytes);
+                if (!t->data_fp16) { tensor_free(t); return VOXCPM_ERR_OOM; }
+                memcpy(t->data_fp16, src, bytes);
+                t->is_fp16 = true;
             }
             break;
         }
@@ -1637,8 +1783,9 @@ VoxCPMError weight_load_tensor(
         }
     }
 
-    /* Clamp NaN to zero — safety net for edge cases in FP16/BF16 conversion */
-    {
+    /* Clamp NaN to zero — safety net for edge cases in BF16 conversion.
+     * Skip for fp16 tensors: they have no fp32 data yet. */
+    if (!t->is_fp16) {
         int nan_count = 0;
         for (int64_t i = 0; i < num_elems; i++) {
             if (isnan(t->data[i])) { t->data[i] = 0.0f; nan_count++; }

@@ -503,32 +503,41 @@ VoxCPMError loc_dit_sample(
 
     /* ─── Flow Matching Euler ODE solver ───
      *
-     * Timesteps go uniformly from t=1.0 (noise) down to t=sigma_min (near data).
-     * The model predicts the velocity field v = dx/dt.
-     * Euler reverse step: x_{t+dt} = x_t + dt * v_pred, with dt < 0.
+     * Reverse ODE from t=1.0 (noise) down to t~sigma_min (near data).
+     * The model predicts velocity v = dx/dt in the forward direction (data→noise).
+     * To reverse: x_{t-|dt|} = x_t - |dt| * v_pred.
+     *
+     * CRITICAL: dt is always POSITIVE — the model's delta_mlp was trained with
+     * positive dt (sinusoidal_embedding(x) where x>0). Passing negative dt would
+     * produce out-of-distribution sin(-x) = -sin(x) values.
      *
      * Config: cfm_config.sigma_min = 1e-6, solver = "euler", t_scheduler = "log-norm"
      * Here we use a uniform t schedule for simplicity (log-norm would skew toward
      * low-noise regions; uniform is a safe default for Euler).
      */
     const float sigma_min = 1e-6f;
-    const float dt = -(1.0f - sigma_min) / (float)n_timesteps;  /* negative, reverse */
+    const float dt = (1.0f - sigma_min) / (float)n_timesteps;  /* positive step size */
+
+    LOG_INFO("loc_dit_sample: starting B=%d F=%d P=%d T_cond=%d steps=%d cfg=%.1f",
+             B, F, P, T_cond, n_timesteps, cfg_value);
 
     for (int i = 0; i < n_timesteps; i++) {
-        float t_cur = 1.0f + (float)i * dt;  /* decreases: 1.0, 0.9, ..., sigma_min+dt */
+        float t_cur = 1.0f - (float)i * dt;  /* decreases: 1.0, 0.9, ..., sigma_min */
 
-        /* Fill timestep tensors */
+        /* Fill timestep tensors: both t and dt are POSITIVE (matches training) */
         for (int b = 0; b < B; b++) {
             t_tensor->data[b]  = t_cur;
-            dt_tensor->data[b] = dt;    /* negative — tells model we're reversing */
+            dt_tensor->data[b] = dt;
         }
 
         /* ─── Conditional velocity prediction ─── */
+        LOG_INFO("loc_dit_sample: calling loc_dit_forward step %d/%d (t_cur=%.4f)", i+1, n_timesteps, t_cur);
         err = loc_dit_forward(dit, x_t, mu, cond, t_tensor, dt_tensor, pred);
         if (err) {
             LOG_ERROR("loc_dit_sample: forward failed at step %d/%d", i, n_timesteps);
             goto cleanup_sample;
         }
+        LOG_INFO("loc_dit_sample: forward OK step %d/%d", i+1, n_timesteps);
 
         /* ─── CFG: unconditional prediction + combine ─── */
         if (cfg_value > 1.0f && uncond) {
@@ -548,11 +557,11 @@ VoxCPMError loc_dit_sample(
         }
 
         /* ─── Euler reverse step ───
-         *   x_{t+dt} = x_t + dt * v_pred
-         *   dt < 0, so this moves from noise toward data.
+         *   x_{t-|dt|} = x_t - |dt| * v_pred
+         *   dt > 0, so we subtract to move from noise toward data.
          */
         for (size_t j = 0; j < x_t->size; j++) {
-            x_next->data[j] = x_t->data[j] + dt * pred->data[j];
+            x_next->data[j] = x_t->data[j] - dt * pred->data[j];
         }
 
         /* Swap x_t and x_next for next iteration */
@@ -563,8 +572,10 @@ VoxCPMError loc_dit_sample(
         }
     }
 
+    LOG_INFO("loc_dit_sample: loop done, copying output...");
     /* Copy final denoised result to output */
     err = tensor_copy(out, x_t);
+    LOG_INFO("loc_dit_sample: copy done, cleaning up...");
 
 cleanup_sample:
     tensor_free(x_t);
