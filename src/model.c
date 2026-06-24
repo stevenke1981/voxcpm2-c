@@ -1128,7 +1128,7 @@ void loc_enc_free(LocEnc* enc) {
     tensor_free(enc->special_token);
     if (enc->layers) {
         for (int i = 0; i < enc->n_layers; i++) {
-            transformer_block_free(&enc->layers[i]);
+            transformer_block_free_sub(&enc->layers[i]);
         }
         free(enc->layers);
     }
@@ -1192,7 +1192,7 @@ void tslm_free(TSLM* tslm) {
     tensor_free(tslm->embed_weight);
     if (tslm->layers) {
         for (int i = 0; i < tslm->n_layers; i++) {
-            transformer_block_free(&tslm->layers[i]);
+            transformer_block_free_sub(&tslm->layers[i]);
         }
         free(tslm->layers);
     }
@@ -1253,7 +1253,7 @@ void ralm_free(RALM* ralm) {
     if (!ralm) return;
     if (ralm->layers) {
         for (int i = 0; i < ralm->n_layers; i++) {
-            transformer_block_free(&ralm->layers[i]);
+            transformer_block_free_sub(&ralm->layers[i]);
         }
         free(ralm->layers);
     }
@@ -1339,7 +1339,7 @@ void loc_dit_free(LocDiT* dit) {
     tensor_free(dit->delta_mlp_2_bias);
     if (dit->layers) {
         for (int i = 0; i < dit->n_layers; i++) {
-            transformer_block_free(&dit->layers[i]);
+            transformer_block_free_sub(&dit->layers[i]);
         }
         free(dit->layers);
     }

@@ -561,12 +561,20 @@ TransformerBlock* transformer_block_create(
     return block;
 }
 
-void transformer_block_free(TransformerBlock* block) {
+/* Free sub-modules of a TransformerBlock WITHOUT freeing the block itself.
+ * Use for blocks embedded in arrays (e.g., tslm->layers[i]).
+ * For heap-allocated blocks, use transformer_block_free instead. */
+void transformer_block_free_sub(TransformerBlock* block) {
     if (!block) return;
     rms_norm_free(block->rms_attn);
     attention_free(block->attn);
     rms_norm_free(block->rms_ffn);
     swiglu_free(block->ffn);
+}
+
+void transformer_block_free(TransformerBlock* block) {
+    if (!block) return;
+    transformer_block_free_sub(block);
     free(block);
 }
 

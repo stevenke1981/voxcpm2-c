@@ -139,6 +139,7 @@ typedef struct {
 TransformerBlock* transformer_block_create(
     int d_model, int n_heads, int n_kv_heads, int d_ff, float norm_eps
 );
+void transformer_block_free_sub(TransformerBlock* block);
 void transformer_block_free(TransformerBlock* block);
 
 VoxCPMError transformer_block_forward(
